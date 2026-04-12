@@ -7,11 +7,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "0.1.2", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "0.1.3", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -31,10 +30,11 @@ namespace AutoSwitch
             "Switch16CU"
         };
 
-        private static readonly HashSet<string> AllowedRackNames = new(StringComparer.OrdinalIgnoreCase)
+        private static readonly string[] SwitchNameHints =
         {
-            "Rack_Lanberg_47U",
-            "BoxedRack"
+            "switch",
+            "qsfp",
+            "sfp"
         };
 
         private static string DebugFolderPath =>
@@ -45,13 +45,14 @@ namespace AutoSwitch
 
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
+        private bool _loggedNearMissesThisScene;
 
         public override void OnInitializeMelon()
         {
             ClassInjector.RegisterTypeInIl2Cpp<FabricGroupTag>();
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(DebugLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] AutoSwitch debug log started.{Environment.NewLine}");
-            MelonLogger.Msg("[AutoSwitch] Debug build active. Automatic scan logging only.");
+            MelonLogger.Msg("[AutoSwitch] v0.1.3 debug build active. Loose detection mode.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -61,6 +62,7 @@ namespace AutoSwitch
 
             _nextScanTime = 0f;
             _lastSummary = string.Empty;
+            _loggedNearMissesThisScene = false;
             LogToFile($"Scene loaded: {sceneName} ({buildIndex})");
         }
 
@@ -85,7 +87,7 @@ namespace AutoSwitch
         private void RunDiscoveryScan()
         {
             List<SwitchNode> switches = DiscoverRealSwitchRoots();
-            Dictionary<Transform, List<SwitchNode>> byRack = GroupByRack(switches);
+            Dictionary<Transform, List<SwitchNode>> byRack = GroupByRackLikeParent(switches);
 
             int rackCount = byRack.Count;
             int switchCount = switches.Count;
@@ -119,26 +121,42 @@ namespace AutoSwitch
                         .OrderByDescending(s => s.LocalPosition.y)
                         .ToList();
 
+                    string rackName = rackRoot != null ? rackRoot.name : "<null>";
                     string rackLine =
-                        $"RACK | name={rackRoot.name} | switchCount={ordered.Count} | switches={string.Join(", ", ordered.Select(s => $"{s.GameObject.name}[ports={s.TotalPorts}]"))}";
+                        $"GROUP | parent={rackName} | switchCount={ordered.Count} | switches={string.Join(", ", ordered.Select(s => $"{s.GameObject.name}[ports={s.TotalPorts}]"))}";
                     LogToFile(rackLine);
                 }
+
+                foreach (SwitchNode node in switches)
+                {
+                    LogToFile(
+                        $"SWITCH | name={node.GameObject.name} | normalized={NormalizeCloneName(node.GameObject.name)} | parent={node.ParentName} | chain={node.ParentChain} | local=({node.LocalPosition.x:0.###},{node.LocalPosition.y:0.###},{node.LocalPosition.z:0.###}) | world=({node.WorldPosition.x:0.###},{node.WorldPosition.y:0.###},{node.WorldPosition.z:0.###}) | qsfp={node.QsfpPortCount} | sfp={node.SfpPortCount} | total={node.TotalPorts} | height={node.ApproxHeight:0.###}"
+                    );
+                }
+            }
+
+            if (!_loggedNearMissesThisScene)
+            {
+                _loggedNearMissesThisScene = true;
+                DumpNearMisses();
             }
         }
 
-        private static Dictionary<Transform, List<SwitchNode>> GroupByRack(List<SwitchNode> switches)
+        private static Dictionary<Transform, List<SwitchNode>> GroupByRackLikeParent(List<SwitchNode> switches)
         {
             var result = new Dictionary<Transform, List<SwitchNode>>();
 
             foreach (SwitchNode sw in switches)
             {
-                if (sw.RackRoot == null)
+                Transform key = sw.GroupRoot ?? sw.GameObject.transform.parent;
+
+                if (key == null)
                     continue;
 
-                if (!result.TryGetValue(sw.RackRoot, out List<SwitchNode> list))
+                if (!result.TryGetValue(key, out List<SwitchNode> list))
                 {
                     list = new List<SwitchNode>();
-                    result[sw.RackRoot] = list;
+                    result[key] = list;
                 }
 
                 list.Add(sw);
@@ -164,22 +182,22 @@ namespace AutoSwitch
                 if (seen.Contains(id))
                     continue;
 
-                if (!LooksLikeRealSwitchRoot(go))
+                if (!LooksLikeRealSwitchRoot(go, out int qsfpCount, out int sfpCount))
                     continue;
 
-                Transform rackRoot = FindAllowedRackRoot(go.transform);
-                if (rackRoot == null)
-                    continue;
+                Transform groupRoot = FindGroupingParent(go.transform);
 
                 SwitchNode node = new SwitchNode
                 {
                     GameObject = go,
-                    RackRoot = rackRoot,
+                    GroupRoot = groupRoot,
+                    ParentName = go.transform.parent != null ? go.transform.parent.name : "<root>",
+                    ParentChain = BuildParentChain(go.transform, 5),
                     WorldPosition = go.transform.position,
                     LocalPosition = go.transform.localPosition,
                     ApproxHeight = EstimateObjectHeight(go),
-                    QsfpPortCount = CountPorts(go, "QSFP_port."),
-                    SfpPortCount = CountPorts(go, "SFP_port.")
+                    QsfpPortCount = qsfpCount,
+                    SfpPortCount = sfpCount
                 };
 
                 if (node.TotalPorts <= 0)
@@ -192,21 +210,38 @@ namespace AutoSwitch
             return results;
         }
 
-        private static bool LooksLikeRealSwitchRoot(GameObject go)
+        private static bool LooksLikeRealSwitchRoot(GameObject go, out int qsfpCount, out int sfpCount)
         {
+            qsfpCount = 0;
+            sfpCount = 0;
+
             if (go == null)
                 return false;
 
             string baseName = NormalizeCloneName(go.name);
-            if (!AllowedSwitchNames.Contains(baseName))
+            string lowerBase = baseName.ToLowerInvariant();
+
+            bool allowedByExactName = AllowedSwitchNames.Contains(baseName);
+            bool allowedByHint = SwitchNameHints.Any(h => lowerBase.Contains(h));
+
+            if (!allowedByExactName && !allowedByHint)
                 return false;
 
-            int qsfpCount = CountPorts(go, "QSFP_port.");
-            int sfpCount = CountPorts(go, "SFP_port.");
+            qsfpCount = CountPorts(go, "QSFP_port.");
+            sfpCount = CountPorts(go, "SFP_port.");
+
             int totalPorts = qsfpCount + sfpCount;
 
-            if (totalPorts < 4)
-                return false;
+            if (allowedByExactName)
+            {
+                if (totalPorts < 4)
+                    return false;
+            }
+            else
+            {
+                if (totalPorts < 8)
+                    return false;
+            }
 
             Transform parent = go.transform.parent;
             if (parent != null && parent.gameObject != null)
@@ -219,7 +254,7 @@ namespace AutoSwitch
             return true;
         }
 
-        private static Transform FindAllowedRackRoot(Transform start)
+        private static Transform FindGroupingParent(Transform start)
         {
             if (start == null)
                 return null;
@@ -227,14 +262,20 @@ namespace AutoSwitch
             Transform current = start.parent;
             while (current != null)
             {
-                string baseName = NormalizeCloneName(current.name);
-                if (AllowedRackNames.Contains(baseName))
+                string lower = NormalizeCloneName(current.name).ToLowerInvariant();
+
+                if (lower.Contains("rack") ||
+                    lower.Contains("usableobjects") ||
+                    lower.Contains("customerbase") ||
+                    lower.Contains("customerbases"))
+                {
                     return current;
+                }
 
                 current = current.parent;
             }
 
-            return null;
+            return start.parent;
         }
 
         private static string NormalizeCloneName(string name)
@@ -310,6 +351,68 @@ namespace AutoSwitch
             return true;
         }
 
+        private void DumpNearMisses()
+        {
+            try
+            {
+                Transform[] allTransforms = UnityEngine.Object.FindObjectsOfType<Transform>();
+
+                LogToFile("NEAR MISS DUMP START");
+
+                int written = 0;
+                foreach (Transform t in allTransforms)
+                {
+                    if (t == null || t.gameObject == null)
+                        continue;
+
+                    string name = t.gameObject.name ?? string.Empty;
+                    string lower = name.ToLowerInvariant();
+
+                    if (!(lower.Contains("switch") || lower.Contains("qsfp") || lower.Contains("sfp")))
+                        continue;
+
+                    int qsfpCount = CountPorts(t.gameObject, "QSFP_port.");
+                    int sfpCount = CountPorts(t.gameObject, "SFP_port.");
+
+                    LogToFile(
+                        $"NEAR MISS | name={t.gameObject.name} | normalized={NormalizeCloneName(t.gameObject.name)} | parent={t.parent?.name ?? "<root>"} | chain={BuildParentChain(t, 4)} | qsfp={qsfpCount} | sfp={sfpCount}"
+                    );
+
+                    written++;
+                    if (written >= 60)
+                        break;
+                }
+
+                LogToFile("NEAR MISS DUMP END");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"DumpNearMisses failed: {ex}");
+            }
+        }
+
+        private static string BuildParentChain(Transform t, int depth)
+        {
+            if (t == null)
+                return "<null>";
+
+            List<string> parts = new();
+            Transform current = t.parent;
+            int count = 0;
+
+            while (current != null && count < depth)
+            {
+                parts.Add(current.name);
+                current = current.parent;
+                count++;
+            }
+
+            if (parts.Count == 0)
+                return "<root>";
+
+            return string.Join(" <- ", parts);
+        }
+
         private static void LogToFile(string message)
         {
             try
@@ -337,7 +440,9 @@ namespace AutoSwitch
     internal sealed class SwitchNode
     {
         public GameObject GameObject;
-        public Transform RackRoot;
+        public Transform GroupRoot;
+        public string ParentName;
+        public string ParentChain;
         public Vector3 WorldPosition;
         public Vector3 LocalPosition;
         public float ApproxHeight;
