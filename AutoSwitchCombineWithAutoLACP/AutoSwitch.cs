@@ -3,6 +3,7 @@ using Il2CppInterop.Runtime.Injection;
 using MelonLoader;
 using MelonLoader.Utils;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -11,7 +12,7 @@ using System.Reflection;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "0.1.7", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "0.1.8", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -36,61 +37,24 @@ namespace AutoSwitch
             "Switch16CU"
         };
 
-        private static readonly string[] InterestingNeedles =
-        {
-            "lacp",
-            "group",
-            "bond",
-            "portchannel",
-            "channel",
-            "bandwidth",
-            "throughput",
-            "speed",
-            "transfer",
-            "traffic",
-            "packet",
-            "link",
-            "network",
-            "cable",
-            "devicea",
-            "deviceb",
-            "groupid"
-        };
-
-        private static readonly string[] RecalcMethodNeedles =
-        {
-            "refresh",
-            "recalc",
-            "recalculate",
-            "rebuild",
-            "recompute",
-            "update",
-            "apply",
-            "sync",
-            "reload",
-            "bandwidth",
-            "throughput",
-            "network",
-            "traffic",
-            "speed",
-            "link"
-        };
-
         private static string DebugFolderPath =>
             Path.Combine(MelonEnvironment.ModsDirectory, "AutoSwitch");
 
         private static string DebugLogPath =>
             Path.Combine(DebugFolderPath, "autoswitch-debug.log");
 
+        private static readonly Dictionary<string, string> LastClusterSignatures = new(StringComparer.OrdinalIgnoreCase);
+
+        // Native speed path maps.
+        private static readonly Dictionary<int, float> CableIdToFabricSpeed = new();
+        private static readonly Dictionary<string, float> FabricIdToSpeed = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, HashSet<int>> FabricIdToCableIds = new(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedPatches = new(StringComparer.OrdinalIgnoreCase);
+
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
         private bool _loggedNearMissesThisScene;
-        private bool _loggedNativeTypeScanThisScene;
-
-        private static readonly Dictionary<string, string> LastClusterSignatures = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> LoggedComponentTypes = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> LoggedTypeMembers = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> LoggedNativeTypes = new(StringComparer.OrdinalIgnoreCase);
 
         public override void OnInitializeMelon()
         {
@@ -99,7 +63,9 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(DebugLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] AutoSwitch debug log started.{Environment.NewLine}");
 
-            MelonLogger.Msg("[AutoSwitch] v0.1.7 active. Cluster mode with throughput patch scaffolding.");
+            InstallNativePatches();
+
+            MelonLogger.Msg("[AutoSwitch] v0.1.8 active. Native cable/LACP speed patch path enabled.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -110,12 +76,11 @@ namespace AutoSwitch
             _nextScanTime = 0f;
             _lastSummary = string.Empty;
             _loggedNearMissesThisScene = false;
-            _loggedNativeTypeScanThisScene = false;
 
             LastClusterSignatures.Clear();
-            LoggedComponentTypes.Clear();
-            LoggedTypeMembers.Clear();
-            LoggedNativeTypes.Clear();
+            CableIdToFabricSpeed.Clear();
+            FabricIdToSpeed.Clear();
+            FabricIdToCableIds.Clear();
 
             LogToFile($"Scene loaded: {sceneName} ({buildIndex})");
         }
@@ -167,16 +132,10 @@ namespace AutoSwitch
             }
 
             ApplyFabricCombining(activeFabrics);
-            IntrospectActiveFabrics(activeFabrics);
-
-            if (!_loggedNativeTypeScanThisScene)
-            {
-                _loggedNativeTypeScanThisScene = true;
-                ScanAssemblyForInterestingTypes();
-            }
+            ApplyNativeSpeedOverrides(activeFabrics);
 
             string summary =
-                $"SCAN SUMMARY | rawCandidates={rawCandidates.Count} | filteredSwitches={filtered.Count} | activeFabrics={activeFabrics.Count} | adjacentPairs={adjacencyPairs}";
+                $"SCAN SUMMARY | rawCandidates={rawCandidates.Count} | filteredSwitches={filtered.Count} | activeFabrics={activeFabrics.Count} | adjacentPairs={adjacencyPairs} | trackedCableIds={CableIdToFabricSpeed.Count}";
 
             if (!string.Equals(summary, _lastSummary, StringComparison.Ordinal))
             {
@@ -188,9 +147,10 @@ namespace AutoSwitch
                 foreach (List<SwitchNode> fabric in activeFabrics)
                 {
                     float totalEstimatedCapacity = fabric.Sum(f => f.EstimatedCapacityGbps);
+                    string fabricId = $"FABRIC-{fabricIndex:000}";
 
                     string fabricLine =
-                        $"FABRIC | id=FABRIC-{fabricIndex:000} | members={fabric.Count} | estCapacityGbps={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)} | switches={string.Join(", ", fabric.Select(s => $"{s.GameObject.name}@({s.WorldPosition.x:0.###},{s.WorldPosition.y:0.###},{s.WorldPosition.z:0.###})[ports={s.TotalPorts}]"))}";
+                        $"FABRIC | id={fabricId} | members={fabric.Count} | estCapacityGbps={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)} | trackedCableIds={GetTrackedCableCountForFabric(fabricId)} | switches={string.Join(", ", fabric.Select(s => $"{s.GameObject.name}@({s.WorldPosition.x:0.###},{s.WorldPosition.y:0.###},{s.WorldPosition.z:0.###})[ports={s.TotalPorts}]"))}";
                     LogToFile(fabricLine);
 
                     fabricIndex++;
@@ -202,6 +162,74 @@ namespace AutoSwitch
                 _loggedNearMissesThisScene = true;
                 DumpNearMisses();
             }
+        }
+
+        private void InstallNativePatches()
+        {
+            try
+            {
+                Type cableLinkType = AccessTools.TypeByName("Il2Cpp.CableLink");
+                if (cableLinkType != null)
+                {
+                    MethodInfo getter = AccessTools.PropertyGetter(cableLinkType, "connectionSpeed");
+                    if (getter != null)
+                    {
+                        HarmonyInstance.Patch(
+                            getter,
+                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_GetConnectionSpeed_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
+                        );
+                        LogPatch("Patched CableLink.get_connectionSpeed");
+                    }
+
+                    MethodInfo setterMethod = AccessTools.Method(cableLinkType, "SetConnectionSpeed", new[] { typeof(float) });
+                    if (setterMethod != null)
+                    {
+                        HarmonyInstance.Patch(
+                            setterMethod,
+                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_SetConnectionSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
+                        );
+                        LogPatch("Patched CableLink.SetConnectionSpeed");
+                    }
+                }
+
+                Type lacpGroupType = AccessTools.TypeByName("Il2Cpp.NetworkMap+LACPGroup");
+                if (lacpGroupType != null)
+                {
+                    MethodInfo aggSpeed = AccessTools.Method(lacpGroupType, "GetAggregatedSpeed");
+                    if (aggSpeed != null)
+                    {
+                        HarmonyInstance.Patch(
+                            aggSpeed,
+                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(LACPGroup_GetAggregatedSpeed_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
+                        );
+                        LogPatch("Patched NetworkMap+LACPGroup.GetAggregatedSpeed");
+                    }
+                }
+
+                Type networkMapType = AccessTools.TypeByName("Il2Cpp.NetworkMap");
+                if (networkMapType != null)
+                {
+                    MethodInfo updateServerSpeed = AccessTools.Method(networkMapType, "UpdateCustomerServerCountAndSpeed");
+                    if (updateServerSpeed != null)
+                    {
+                        HarmonyInstance.Patch(
+                            updateServerSpeed,
+                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
+                        );
+                        LogPatch("Patched NetworkMap.UpdateCustomerServerCountAndSpeed");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"InstallNativePatches failed: {ex}");
+            }
+        }
+
+        private static void LogPatch(string message)
+        {
+            if (LoggedPatches.Add(message))
+                LogToFile(message);
         }
 
         private void ApplyFabricCombining(List<List<SwitchNode>> activeFabrics)
@@ -237,14 +265,79 @@ namespace AutoSwitch
                     ApplyCombinedFabricToSwitch(node, fabricId, i + 1, ordered.Count, totalEstimatedCapacity, totalPorts);
                 }
 
-                foreach (SwitchNode node in ordered)
-                {
-                    TryInvokeRecalcMethods(node.GameObject);
-                }
-
                 LogToFile($"APPLY | fabricId={fabricId} | members={ordered.Count} | totalPorts={totalPorts} | estCapacityGbps={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)}");
                 clusterIndex++;
             }
+        }
+
+        private void ApplyNativeSpeedOverrides(List<List<SwitchNode>> activeFabrics)
+        {
+            CableIdToFabricSpeed.Clear();
+            FabricIdToSpeed.Clear();
+            FabricIdToCableIds.Clear();
+
+            int clusterIndex = 1;
+
+            foreach (List<SwitchNode> fabric in activeFabrics)
+            {
+                string fabricId = $"FABRIC-{clusterIndex:000}";
+                float totalEstimatedCapacity = fabric.Sum(x => x.EstimatedCapacityGbps);
+
+                FabricIdToSpeed[fabricId] = totalEstimatedCapacity;
+                FabricIdToCableIds[fabricId] = new HashSet<int>();
+
+                foreach (SwitchNode node in fabric)
+                {
+                    if (node?.GameObject == null)
+                        continue;
+
+                    foreach (Component c in node.GameObject.GetComponentsInChildren<Component>(true))
+                    {
+                        if (c == null)
+                            continue;
+
+                        string typeName = c.GetType().FullName ?? c.GetType().Name;
+                        if (!typeName.Contains("CableLink", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        List<int> cableIds = ExtractCableIds(c);
+                        if (cableIds.Count == 0)
+                            continue;
+
+                        foreach (int cableId in cableIds)
+                        {
+                            if (cableId <= 0)
+                                continue;
+
+                            if (CableIdToFabricSpeed.TryGetValue(cableId, out float existing))
+                                CableIdToFabricSpeed[cableId] = Mathf.Max(existing, totalEstimatedCapacity);
+                            else
+                                CableIdToFabricSpeed[cableId] = totalEstimatedCapacity;
+
+                            FabricIdToCableIds[fabricId].Add(cableId);
+                        }
+
+                        TrySetFloatMember(c, "connectionSpeed", totalEstimatedCapacity);
+                        TryInvokeOneFloatMethod(c, "SetConnectionSpeed", totalEstimatedCapacity);
+                    }
+                }
+
+                if (FabricIdToCableIds[fabricId].Count > 0)
+                {
+                    string cableList = string.Join(",", FabricIdToCableIds[fabricId].OrderBy(x => x));
+                    LogToFile($"NATIVE SPEED APPLY | fabricId={fabricId} | speed={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)} | cableIds=[{cableList}]");
+                }
+
+                clusterIndex++;
+            }
+        }
+
+        private static int GetTrackedCableCountForFabric(string fabricId)
+        {
+            if (FabricIdToCableIds.TryGetValue(fabricId, out HashSet<int> ids))
+                return ids.Count;
+
+            return 0;
         }
 
         private static string BuildFabricSignature(List<SwitchNode> fabric, float totalEstimatedCapacity, int totalPorts)
@@ -307,223 +400,6 @@ namespace AutoSwitch
             TrySetIntMember(target, "fabricPortCount", totalPorts);
             TrySetIntMember(target, "memberIndex", memberIndex);
             TrySetIntMember(target, "memberCount", memberCount);
-        }
-
-        private void IntrospectActiveFabrics(List<List<SwitchNode>> activeFabrics)
-        {
-            foreach (List<SwitchNode> fabric in activeFabrics)
-            {
-                foreach (SwitchNode node in fabric)
-                {
-                    if (node?.GameObject == null)
-                        continue;
-
-                    Component[] components = node.GameObject.GetComponentsInChildren<Component>(true);
-                    foreach (Component component in components)
-                    {
-                        if (component == null)
-                            continue;
-
-                        Type t = component.GetType();
-                        string typeName = t.FullName ?? t.Name;
-
-                        if (!LoggedComponentTypes.Contains(typeName))
-                        {
-                            LoggedComponentTypes.Add(typeName);
-                            LogToFile($"COMPONENT TYPE | {typeName}");
-                        }
-
-                        if (HasInterestingName(typeName))
-                        {
-                            LogInterestingMembers(t);
-                        }
-                        else
-                        {
-                            if (TypeContainsInterestingMembers(t))
-                                LogInterestingMembers(t);
-                        }
-                    }
-                }
-            }
-        }
-
-        private void ScanAssemblyForInterestingTypes()
-        {
-            try
-            {
-                Assembly assembly = typeof(AutoSwitchMod).Assembly;
-                LogToFile($"LOCAL ASSEMBLY | {assembly.GetName().Name}");
-
-                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    string asmName = asm.GetName().Name ?? string.Empty;
-
-                    if (!asmName.Equals("Assembly-CSharp", StringComparison.OrdinalIgnoreCase) &&
-                        !asmName.Contains("Assembly-CSharp", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    LogToFile($"INTERESTING TYPE SCAN | assembly={asmName}");
-
-                    foreach (Type t in SafeGetTypes(asm))
-                    {
-                        if (t == null)
-                            continue;
-
-                        string fullName = t.FullName ?? t.Name;
-                        if (!HasInterestingName(fullName))
-                            continue;
-
-                        if (LoggedNativeTypes.Add(fullName))
-                        {
-                            LogToFile($"NATIVE TYPE | {fullName}");
-                            LogInterestingMembers(t);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"ScanAssemblyForInterestingTypes failed: {ex}");
-            }
-        }
-
-        private static IEnumerable<Type> SafeGetTypes(Assembly asm)
-        {
-            try
-            {
-                return asm.GetTypes();
-            }
-            catch (ReflectionTypeLoadException ex)
-            {
-                return ex.Types.Where(t => t != null);
-            }
-            catch
-            {
-                return Array.Empty<Type>();
-            }
-        }
-
-        private static bool HasInterestingName(string name)
-        {
-            if (string.IsNullOrWhiteSpace(name))
-                return false;
-
-            string lower = name.ToLowerInvariant();
-            return InterestingNeedles.Any(n => lower.Contains(n));
-        }
-
-        private static bool TypeContainsInterestingMembers(Type t)
-        {
-            try
-            {
-                foreach (FieldInfo field in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    if (HasInterestingName(field.Name))
-                        return true;
-                }
-
-                foreach (PropertyInfo prop in t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    if (HasInterestingName(prop.Name))
-                        return true;
-                }
-
-                foreach (MethodInfo method in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    if (HasInterestingName(method.Name))
-                        return true;
-                }
-            }
-            catch
-            {
-            }
-
-            return false;
-        }
-
-        private static void LogInterestingMembers(Type t)
-        {
-            string typeName = t.FullName ?? t.Name;
-            if (!LoggedTypeMembers.Add(typeName))
-                return;
-
-            try
-            {
-                foreach (FieldInfo field in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    if (!HasInterestingName(field.Name))
-                        continue;
-
-                    LogToFileStatic($"FIELD | {typeName} | {field.FieldType.Name} {field.Name}");
-                }
-
-                foreach (PropertyInfo prop in t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    if (!HasInterestingName(prop.Name))
-                        continue;
-
-                    LogToFileStatic($"PROPERTY | {typeName} | {prop.PropertyType.Name} {prop.Name}");
-                }
-
-                foreach (MethodInfo method in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    if (!HasInterestingName(method.Name))
-                        continue;
-
-                    LogToFileStatic($"METHOD | {typeName} | {method.Name}");
-                }
-            }
-            catch (Exception ex)
-            {
-                LogToFileStatic($"LogInterestingMembers failed for {typeName}: {ex.Message}");
-            }
-        }
-
-        private static void TryInvokeRecalcMethods(GameObject go)
-        {
-            if (go == null)
-                return;
-
-            foreach (Component component in go.GetComponentsInChildren<Component>(true))
-            {
-                if (component == null)
-                    continue;
-
-                Type t = component.GetType();
-
-                MethodInfo[] methods;
-                try
-                {
-                    methods = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                foreach (MethodInfo method in methods)
-                {
-                    if (method == null)
-                        continue;
-
-                    if (method.GetParameters().Length != 0)
-                        continue;
-
-                    string lower = method.Name.ToLowerInvariant();
-                    if (!RecalcMethodNeedles.Any(n => lower.Contains(n)))
-                        continue;
-
-                    try
-                    {
-                        method.Invoke(component, null);
-                    }
-                    catch
-                    {
-                    }
-                }
-            }
         }
 
         private List<SwitchNode> DiscoverPlacedLooseSwitchCandidates()
@@ -773,6 +649,98 @@ namespace AutoSwitch
             }
         }
 
+        private static List<int> ExtractCableIds(object cableLinkObj)
+        {
+            var result = new List<int>();
+
+            if (cableLinkObj == null)
+                return result;
+
+            object value = TryGetMemberValue(cableLinkObj, "cableIDsOnLink");
+            if (value == null)
+                value = TryGetMemberValue(cableLinkObj, "cableId");
+
+            if (value == null)
+                return result;
+
+            try
+            {
+                if (value is int one)
+                {
+                    result.Add(one);
+                    return result;
+                }
+
+                if (value is IEnumerable enumerable && value is not string)
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (item == null)
+                            continue;
+
+                        if (int.TryParse(item.ToString(), out int parsed))
+                            result.Add(parsed);
+                    }
+                }
+                else
+                {
+                    if (int.TryParse(value.ToString(), out int parsed))
+                        result.Add(parsed);
+                }
+            }
+            catch
+            {
+            }
+
+            return result.Distinct().ToList();
+        }
+
+        private static object TryGetMemberValue(object target, string memberName)
+        {
+            if (target == null || string.IsNullOrWhiteSpace(memberName))
+                return null;
+
+            try
+            {
+                Type t = target.GetType();
+
+                PropertyInfo prop = t.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (prop != null && prop.CanRead)
+                    return prop.GetValue(target);
+
+                FieldInfo field = t.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (field != null)
+                    return field.GetValue(target);
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
+        private static void TryInvokeOneFloatMethod(object target, string methodName, float value)
+        {
+            if (target == null)
+                return;
+
+            try
+            {
+                MethodInfo method = target.GetType().GetMethod(
+                    methodName,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    binder: null,
+                    types: new[] { typeof(float) },
+                    modifiers: null);
+
+                if (method != null)
+                    method.Invoke(target, new object[] { value });
+            }
+            catch
+            {
+            }
+        }
+
         private static void TrySetStringMember(object target, string memberName, string value)
         {
             TrySetMember(target, memberName, value);
@@ -899,12 +867,106 @@ namespace AutoSwitch
             }
         }
 
-        private static void LogToFileStatic(string message)
+        // Harmony patches
+
+        private static void CableLink_GetConnectionSpeed_Postfix(object __instance, ref float __result)
         {
             try
             {
-                Directory.CreateDirectory(DebugFolderPath);
-                File.AppendAllText(DebugLogPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}{Environment.NewLine}");
+                if (__instance == null)
+                    return;
+
+                List<int> cableIds = ExtractCableIds(__instance);
+                if (cableIds.Count == 0)
+                    return;
+
+                float overrideSpeed = 0f;
+                foreach (int cableId in cableIds)
+                {
+                    if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
+                        overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                }
+
+                if (overrideSpeed > __result)
+                    __result = overrideSpeed;
+            }
+            catch
+            {
+            }
+        }
+
+        private static void CableLink_SetConnectionSpeed_Prefix(object __instance, ref float __0)
+        {
+            try
+            {
+                if (__instance == null)
+                    return;
+
+                List<int> cableIds = ExtractCableIds(__instance);
+                if (cableIds.Count == 0)
+                    return;
+
+                float overrideSpeed = 0f;
+                foreach (int cableId in cableIds)
+                {
+                    if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
+                        overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                }
+
+                if (overrideSpeed > __0)
+                    __0 = overrideSpeed;
+            }
+            catch
+            {
+            }
+        }
+
+        private static void LACPGroup_GetAggregatedSpeed_Postfix(object __instance, ref float __result)
+        {
+            try
+            {
+                if (__instance == null)
+                    return;
+
+                object value = TryGetMemberValue(__instance, "cableIds");
+                if (value == null)
+                    return;
+
+                float overrideSpeed = 0f;
+
+                if (value is IEnumerable enumerable && value is not string)
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (item == null)
+                            continue;
+
+                        if (!int.TryParse(item.ToString(), out int cableId))
+                            continue;
+
+                        if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
+                            overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                    }
+                }
+
+                if (overrideSpeed > __result)
+                    __result = overrideSpeed;
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix(ref float __2)
+        {
+            try
+            {
+                if (FabricIdToSpeed.Count == 0)
+                    return;
+
+                float maxFabricSpeed = FabricIdToSpeed.Values.Max();
+                if (maxFabricSpeed > __2)
+                    __2 = maxFabricSpeed;
             }
             catch
             {
