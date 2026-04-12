@@ -12,7 +12,7 @@ using System.Reflection;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "0.1.8", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "0.1.9", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -45,11 +45,19 @@ namespace AutoSwitch
 
         private static readonly Dictionary<string, string> LastClusterSignatures = new(StringComparer.OrdinalIgnoreCase);
 
-        // Native speed path maps.
-        private static readonly Dictionary<int, float> CableIdToFabricSpeed = new();
+        // Fabric state
         private static readonly Dictionary<string, float> FabricIdToSpeed = new(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, HashSet<int>> FabricIdToCableIds = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<int, float> CableIdToFabricSpeed = new();
+        private static readonly Dictionary<int, string> CableIdToFabricId = new();
 
+        // Network registration state captured from NetworkMap.RegisterCableConnection
+        private static readonly Dictionary<int, CableRegistrationInfo> RegisteredCables = new();
+        private static readonly Dictionary<string, HashSet<int>> DeviceNameToCableIds = new(StringComparer.OrdinalIgnoreCase);
+
+        // Device-name discovery on switch objects
+        private static readonly Dictionary<int, HashSet<string>> SwitchInstanceIdToDeviceNames = new();
+        private static readonly HashSet<string> LoggedDeviceNameMappings = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> LoggedPatches = new(StringComparer.OrdinalIgnoreCase);
 
         private float _nextScanTime;
@@ -65,7 +73,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v0.1.8 active. Native cable/LACP speed patch path enabled.");
+            MelonLogger.Msg("[AutoSwitch] v0.1.9 active. NetworkMap cable registration path enabled.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -78,9 +86,14 @@ namespace AutoSwitch
             _loggedNearMissesThisScene = false;
 
             LastClusterSignatures.Clear();
-            CableIdToFabricSpeed.Clear();
             FabricIdToSpeed.Clear();
             FabricIdToCableIds.Clear();
+            CableIdToFabricSpeed.Clear();
+            CableIdToFabricId.Clear();
+            RegisteredCables.Clear();
+            DeviceNameToCableIds.Clear();
+            SwitchInstanceIdToDeviceNames.Clear();
+            LoggedDeviceNameMappings.Clear();
 
             LogToFile($"Scene loaded: {sceneName} ({buildIndex})");
         }
@@ -132,10 +145,11 @@ namespace AutoSwitch
             }
 
             ApplyFabricCombining(activeFabrics);
-            ApplyNativeSpeedOverrides(activeFabrics);
+            RefreshSwitchDeviceNameMappings(activeFabrics);
+            RebuildFabricCableMembership(activeFabrics);
 
             string summary =
-                $"SCAN SUMMARY | rawCandidates={rawCandidates.Count} | filteredSwitches={filtered.Count} | activeFabrics={activeFabrics.Count} | adjacentPairs={adjacencyPairs} | trackedCableIds={CableIdToFabricSpeed.Count}";
+                $"SCAN SUMMARY | rawCandidates={rawCandidates.Count} | filteredSwitches={filtered.Count} | activeFabrics={activeFabrics.Count} | adjacentPairs={adjacencyPairs} | registeredCables={RegisteredCables.Count} | trackedCableIds={CableIdToFabricSpeed.Count}";
 
             if (!string.Equals(summary, _lastSummary, StringComparison.Ordinal))
             {
@@ -146,13 +160,12 @@ namespace AutoSwitch
                 int fabricIndex = 1;
                 foreach (List<SwitchNode> fabric in activeFabrics)
                 {
-                    float totalEstimatedCapacity = fabric.Sum(f => f.EstimatedCapacityGbps);
                     string fabricId = $"FABRIC-{fabricIndex:000}";
+                    float totalEstimatedCapacity = fabric.Sum(f => f.EstimatedCapacityGbps);
 
                     string fabricLine =
                         $"FABRIC | id={fabricId} | members={fabric.Count} | estCapacityGbps={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)} | trackedCableIds={GetTrackedCableCountForFabric(fabricId)} | switches={string.Join(", ", fabric.Select(s => $"{s.GameObject.name}@({s.WorldPosition.x:0.###},{s.WorldPosition.y:0.###},{s.WorldPosition.z:0.###})[ports={s.TotalPorts}]"))}";
                     LogToFile(fabricLine);
-
                     fabricIndex++;
                 }
             }
@@ -168,27 +181,37 @@ namespace AutoSwitch
         {
             try
             {
-                Type cableLinkType = AccessTools.TypeByName("Il2Cpp.CableLink");
-                if (cableLinkType != null)
+                Type networkMapType = AccessTools.TypeByName("Il2Cpp.NetworkMap");
+                if (networkMapType != null)
                 {
-                    MethodInfo getter = AccessTools.PropertyGetter(cableLinkType, "connectionSpeed");
-                    if (getter != null)
+                    MethodInfo registerCable = AccessTools.Method(networkMapType, "RegisterCableConnection");
+                    if (registerCable != null)
                     {
                         HarmonyInstance.Patch(
-                            getter,
-                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_GetConnectionSpeed_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
+                            registerCable,
+                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_RegisterCableConnection_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
                         );
-                        LogPatch("Patched CableLink.get_connectionSpeed");
+                        LogPatch("Patched NetworkMap.RegisterCableConnection");
                     }
 
-                    MethodInfo setterMethod = AccessTools.Method(cableLinkType, "SetConnectionSpeed", new[] { typeof(float) });
-                    if (setterMethod != null)
+                    MethodInfo createLacp = AccessTools.Method(networkMapType, "CreateLACPGroup");
+                    if (createLacp != null)
                     {
                         HarmonyInstance.Patch(
-                            setterMethod,
-                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_SetConnectionSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
+                            createLacp,
+                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_CreateLACPGroup_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
                         );
-                        LogPatch("Patched CableLink.SetConnectionSpeed");
+                        LogPatch("Patched NetworkMap.CreateLACPGroup");
+                    }
+
+                    MethodInfo updateServerSpeed = AccessTools.Method(networkMapType, "UpdateCustomerServerCountAndSpeed");
+                    if (updateServerSpeed != null)
+                    {
+                        HarmonyInstance.Patch(
+                            updateServerSpeed,
+                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
+                        );
+                        LogPatch("Patched NetworkMap.UpdateCustomerServerCountAndSpeed");
                     }
                 }
 
@@ -206,17 +229,17 @@ namespace AutoSwitch
                     }
                 }
 
-                Type networkMapType = AccessTools.TypeByName("Il2Cpp.NetworkMap");
-                if (networkMapType != null)
+                Type cableLinkType = AccessTools.TypeByName("Il2Cpp.CableLink");
+                if (cableLinkType != null)
                 {
-                    MethodInfo updateServerSpeed = AccessTools.Method(networkMapType, "UpdateCustomerServerCountAndSpeed");
-                    if (updateServerSpeed != null)
+                    MethodInfo setConnectionSpeed = AccessTools.Method(cableLinkType, "SetConnectionSpeed", new[] { typeof(float) });
+                    if (setConnectionSpeed != null)
                     {
                         HarmonyInstance.Patch(
-                            updateServerSpeed,
-                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
+                            setConnectionSpeed,
+                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_SetConnectionSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
                         );
-                        LogPatch("Patched NetworkMap.UpdateCustomerServerCountAndSpeed");
+                        LogPatch("Patched CableLink.SetConnectionSpeed");
                     }
                 }
             }
@@ -270,11 +293,39 @@ namespace AutoSwitch
             }
         }
 
-        private void ApplyNativeSpeedOverrides(List<List<SwitchNode>> activeFabrics)
+        private void RefreshSwitchDeviceNameMappings(List<List<SwitchNode>> activeFabrics)
         {
-            CableIdToFabricSpeed.Clear();
+            SwitchInstanceIdToDeviceNames.Clear();
+
+            foreach (List<SwitchNode> fabric in activeFabrics)
+            {
+                foreach (SwitchNode node in fabric)
+                {
+                    if (node?.GameObject == null)
+                        continue;
+
+                    int id = node.GameObject.GetInstanceID();
+                    HashSet<string> names = DiscoverPossibleDeviceNames(node.GameObject);
+
+                    if (names.Count == 0)
+                        continue;
+
+                    SwitchInstanceIdToDeviceNames[id] = names;
+
+                    string joined = string.Join(", ", names.OrderBy(x => x));
+                    string logKey = $"{id}:{joined}";
+                    if (LoggedDeviceNameMappings.Add(logKey))
+                        LogToFile($"DEVICE NAME MAP | switch={node.GameObject.name} | names=[{joined}]");
+                }
+            }
+        }
+
+        private void RebuildFabricCableMembership(List<List<SwitchNode>> activeFabrics)
+        {
             FabricIdToSpeed.Clear();
             FabricIdToCableIds.Clear();
+            CableIdToFabricSpeed.Clear();
+            CableIdToFabricId.Clear();
 
             int clusterIndex = 1;
 
@@ -286,46 +337,39 @@ namespace AutoSwitch
                 FabricIdToSpeed[fabricId] = totalEstimatedCapacity;
                 FabricIdToCableIds[fabricId] = new HashSet<int>();
 
+                HashSet<string> allDeviceNames = new(StringComparer.OrdinalIgnoreCase);
+
                 foreach (SwitchNode node in fabric)
                 {
                     if (node?.GameObject == null)
                         continue;
 
-                    foreach (Component c in node.GameObject.GetComponentsInChildren<Component>(true))
+                    int key = node.GameObject.GetInstanceID();
+                    if (SwitchInstanceIdToDeviceNames.TryGetValue(key, out HashSet<string> names))
                     {
-                        if (c == null)
-                            continue;
-
-                        string typeName = c.GetType().FullName ?? c.GetType().Name;
-                        if (!typeName.Contains("CableLink", StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        List<int> cableIds = ExtractCableIds(c);
-                        if (cableIds.Count == 0)
-                            continue;
-
-                        foreach (int cableId in cableIds)
-                        {
-                            if (cableId <= 0)
-                                continue;
-
-                            if (CableIdToFabricSpeed.TryGetValue(cableId, out float existing))
-                                CableIdToFabricSpeed[cableId] = Mathf.Max(existing, totalEstimatedCapacity);
-                            else
-                                CableIdToFabricSpeed[cableId] = totalEstimatedCapacity;
-
-                            FabricIdToCableIds[fabricId].Add(cableId);
-                        }
-
-                        TrySetFloatMember(c, "connectionSpeed", totalEstimatedCapacity);
-                        TryInvokeOneFloatMethod(c, "SetConnectionSpeed", totalEstimatedCapacity);
+                        foreach (string n in names)
+                            allDeviceNames.Add(n);
                     }
+                }
+
+                foreach ((int cableId, CableRegistrationInfo info) in RegisteredCables)
+                {
+                    bool aMatch = !string.IsNullOrWhiteSpace(info.DeviceA) && allDeviceNames.Contains(info.DeviceA);
+                    bool bMatch = !string.IsNullOrWhiteSpace(info.DeviceB) && allDeviceNames.Contains(info.DeviceB);
+
+                    if (!aMatch && !bMatch)
+                        continue;
+
+                    FabricIdToCableIds[fabricId].Add(cableId);
+                    CableIdToFabricSpeed[cableId] = totalEstimatedCapacity;
+                    CableIdToFabricId[cableId] = fabricId;
                 }
 
                 if (FabricIdToCableIds[fabricId].Count > 0)
                 {
                     string cableList = string.Join(",", FabricIdToCableIds[fabricId].OrderBy(x => x));
-                    LogToFile($"NATIVE SPEED APPLY | fabricId={fabricId} | speed={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)} | cableIds=[{cableList}]");
+                    string deviceList = string.Join(", ", allDeviceNames.OrderBy(x => x));
+                    LogToFile($"FABRIC CABLE MAP | fabricId={fabricId} | speed={totalEstimatedCapacity.ToString("0.##", CultureInfo.InvariantCulture)} | deviceNames=[{deviceList}] | cableIds=[{cableList}]");
                 }
 
                 clusterIndex++;
@@ -609,6 +653,119 @@ namespace AutoSwitch
             return qsfpContribution + sfpContribution;
         }
 
+        private static HashSet<string> DiscoverPossibleDeviceNames(GameObject go)
+        {
+            HashSet<string> result = new(StringComparer.OrdinalIgnoreCase);
+            if (go == null)
+                return result;
+
+            foreach (Component c in go.GetComponentsInChildren<Component>(true))
+            {
+                if (c == null)
+                    continue;
+
+                Type t = c.GetType();
+
+                TryAddStringMember(t, c, "deviceName", result);
+                TryAddStringMember(t, c, "DeviceName", result);
+                TryAddStringMember(t, c, "switchId", result);
+                TryAddStringMember(t, c, "SwitchId", result);
+                TryAddStringMember(t, c, "networkId", result);
+                TryAddStringMember(t, c, "NetworkId", result);
+                TryAddStringMember(t, c, "id", result);
+                TryAddStringMember(t, c, "Id", result);
+
+                foreach (FieldInfo f in SafeFields(t))
+                {
+                    if (f.FieldType != typeof(string))
+                        continue;
+
+                    string lower = f.Name.ToLowerInvariant();
+                    if (!(lower.Contains("device") || lower.Contains("switch") || lower.Contains("network") || lower == "id"))
+                        continue;
+
+                    TryAddFieldString(f, c, result);
+                }
+
+                foreach (PropertyInfo p in SafeProperties(t))
+                {
+                    if (p.PropertyType != typeof(string) || !p.CanRead)
+                        continue;
+
+                    string lower = p.Name.ToLowerInvariant();
+                    if (!(lower.Contains("device") || lower.Contains("switch") || lower.Contains("network") || lower == "id"))
+                        continue;
+
+                    TryAddPropertyString(p, c, result);
+                }
+            }
+
+            return result;
+        }
+
+        private static IEnumerable<FieldInfo> SafeFields(Type t)
+        {
+            try { return t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); }
+            catch { return Array.Empty<FieldInfo>(); }
+        }
+
+        private static IEnumerable<PropertyInfo> SafeProperties(Type t)
+        {
+            try { return t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); }
+            catch { return Array.Empty<PropertyInfo>(); }
+        }
+
+        private static void TryAddStringMember(Type t, object obj, string name, HashSet<string> result)
+        {
+            try
+            {
+                FieldInfo f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (f != null && f.FieldType == typeof(string))
+                    AddIfPlausibleDeviceName(f.GetValue(obj) as string, result);
+
+                PropertyInfo p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p != null && p.CanRead && p.PropertyType == typeof(string))
+                    AddIfPlausibleDeviceName(p.GetValue(obj) as string, result);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void TryAddFieldString(FieldInfo f, object obj, HashSet<string> result)
+        {
+            try
+            {
+                AddIfPlausibleDeviceName(f.GetValue(obj) as string, result);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void TryAddPropertyString(PropertyInfo p, object obj, HashSet<string> result)
+        {
+            try
+            {
+                AddIfPlausibleDeviceName(p.GetValue(obj) as string, result);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void AddIfPlausibleDeviceName(string value, HashSet<string> result)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+
+            string trimmed = value.Trim();
+            if (trimmed.Length < 2)
+                return;
+
+            result.Add(trimmed);
+        }
+
         private void DumpNearMisses()
         {
             try
@@ -649,52 +806,6 @@ namespace AutoSwitch
             }
         }
 
-        private static List<int> ExtractCableIds(object cableLinkObj)
-        {
-            var result = new List<int>();
-
-            if (cableLinkObj == null)
-                return result;
-
-            object value = TryGetMemberValue(cableLinkObj, "cableIDsOnLink");
-            if (value == null)
-                value = TryGetMemberValue(cableLinkObj, "cableId");
-
-            if (value == null)
-                return result;
-
-            try
-            {
-                if (value is int one)
-                {
-                    result.Add(one);
-                    return result;
-                }
-
-                if (value is IEnumerable enumerable && value is not string)
-                {
-                    foreach (object item in enumerable)
-                    {
-                        if (item == null)
-                            continue;
-
-                        if (int.TryParse(item.ToString(), out int parsed))
-                            result.Add(parsed);
-                    }
-                }
-                else
-                {
-                    if (int.TryParse(value.ToString(), out int parsed))
-                        result.Add(parsed);
-                }
-            }
-            catch
-            {
-            }
-
-            return result.Distinct().ToList();
-        }
-
         private static object TryGetMemberValue(object target, string memberName)
         {
             if (target == null || string.IsNullOrWhiteSpace(memberName))
@@ -719,47 +830,10 @@ namespace AutoSwitch
             return null;
         }
 
-        private static void TryInvokeOneFloatMethod(object target, string methodName, float value)
-        {
-            if (target == null)
-                return;
-
-            try
-            {
-                MethodInfo method = target.GetType().GetMethod(
-                    methodName,
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                    binder: null,
-                    types: new[] { typeof(float) },
-                    modifiers: null);
-
-                if (method != null)
-                    method.Invoke(target, new object[] { value });
-            }
-            catch
-            {
-            }
-        }
-
-        private static void TrySetStringMember(object target, string memberName, string value)
-        {
-            TrySetMember(target, memberName, value);
-        }
-
-        private static void TrySetBoolMember(object target, string memberName, bool value)
-        {
-            TrySetMember(target, memberName, value);
-        }
-
-        private static void TrySetFloatMember(object target, string memberName, float value)
-        {
-            TrySetMember(target, memberName, value);
-        }
-
-        private static void TrySetIntMember(object target, string memberName, int value)
-        {
-            TrySetMember(target, memberName, value);
-        }
+        private static void TrySetStringMember(object target, string memberName, string value) => TrySetMember(target, memberName, value);
+        private static void TrySetBoolMember(object target, string memberName, bool value) => TrySetMember(target, memberName, value);
+        private static void TrySetFloatMember(object target, string memberName, float value) => TrySetMember(target, memberName, value);
+        private static void TrySetIntMember(object target, string memberName, int value) => TrySetMember(target, memberName, value);
 
         private static void TrySetMember(object target, string memberName, object value)
         {
@@ -867,44 +941,84 @@ namespace AutoSwitch
             }
         }
 
-        // Harmony patches
+        // Harmony patch handlers
 
-        private static void CableLink_GetConnectionSpeed_Postfix(object __instance, ref float __result)
+        private static void NetworkMap_RegisterCableConnection_Postfix(
+            int __0,
+            Vector3 __1,
+            Vector3 __2,
+            object __3,
+            object __4,
+            string __5,
+            string __6,
+            int __7,
+            int __8,
+            string __9,
+            string __10)
         {
             try
             {
-                if (__instance == null)
-                    return;
-
-                List<int> cableIds = ExtractCableIds(__instance);
-                if (cableIds.Count == 0)
-                    return;
-
-                float overrideSpeed = 0f;
-                foreach (int cableId in cableIds)
+                var info = new CableRegistrationInfo
                 {
-                    if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
-                        overrideSpeed = Mathf.Max(overrideSpeed, speed);
-                }
+                    CableId = __0,
+                    DeviceA = __5 ?? string.Empty,
+                    DeviceB = __6 ?? string.Empty,
+                    ExtraA = __9 ?? string.Empty,
+                    ExtraB = __10 ?? string.Empty,
+                    PortA = __7,
+                    PortB = __8
+                };
 
-                if (overrideSpeed > __result)
-                    __result = overrideSpeed;
+                RegisteredCables[__0] = info;
+
+                RegisterDeviceName(__5, __0);
+                RegisterDeviceName(__6, __0);
+                RegisterDeviceName(__9, __0);
+                RegisterDeviceName(__10, __0);
+
+                LogToFile($"REGISTER CABLE | cableId={__0} | deviceA={info.DeviceA} | deviceB={info.DeviceB} | extraA={info.ExtraA} | extraB={info.ExtraB} | portA={__7} | portB={__8}");
             }
-            catch
+            catch (Exception ex)
             {
+                LogToFile($"NetworkMap_RegisterCableConnection_Postfix failed: {ex}");
             }
         }
 
-        private static void CableLink_SetConnectionSpeed_Prefix(object __instance, ref float __0)
+        private static void RegisterDeviceName(string name, int cableId)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return;
+
+            string trimmed = name.Trim();
+            if (!DeviceNameToCableIds.TryGetValue(trimmed, out HashSet<int> ids))
+            {
+                ids = new HashSet<int>();
+                DeviceNameToCableIds[trimmed] = ids;
+            }
+
+            ids.Add(cableId);
+        }
+
+        private static void NetworkMap_CreateLACPGroup_Postfix(string __0, string __1, object __2, ref int __result)
         {
             try
             {
-                if (__instance == null)
-                    return;
+                List<int> cableIds = new();
 
-                List<int> cableIds = ExtractCableIds(__instance);
-                if (cableIds.Count == 0)
-                    return;
+                if (__2 is IEnumerable enumerable && __2 is not string)
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (item == null)
+                            continue;
+
+                        if (int.TryParse(item.ToString(), out int id))
+                            cableIds.Add(id);
+                    }
+                }
+
+                string joined = string.Join(",", cableIds.OrderBy(x => x));
+                LogToFile($"CREATE LACP | groupId={__result} | deviceA={__0} | deviceB={__1} | cableIds=[{joined}]");
 
                 float overrideSpeed = 0f;
                 foreach (int cableId in cableIds)
@@ -913,11 +1027,12 @@ namespace AutoSwitch
                         overrideSpeed = Mathf.Max(overrideSpeed, speed);
                 }
 
-                if (overrideSpeed > __0)
-                    __0 = overrideSpeed;
+                if (overrideSpeed > 0f)
+                    LogToFile($"CREATE LACP SPEED HINT | groupId={__result} | overrideSpeed={overrideSpeed.ToString("0.##", CultureInfo.InvariantCulture)}");
             }
-            catch
+            catch (Exception ex)
             {
+                LogToFile($"NetworkMap_CreateLACPGroup_Postfix failed: {ex}");
             }
         }
 
@@ -951,6 +1066,47 @@ namespace AutoSwitch
 
                 if (overrideSpeed > __result)
                     __result = overrideSpeed;
+            }
+            catch
+            {
+            }
+        }
+
+        private static void CableLink_SetConnectionSpeed_Prefix(object __instance, ref float __0)
+        {
+            try
+            {
+                if (__instance == null)
+                    return;
+
+                object value = TryGetMemberValue(__instance, "cableIDsOnLink");
+                if (value == null)
+                    return;
+
+                float overrideSpeed = 0f;
+
+                if (value is IEnumerable enumerable && value is not string)
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (item == null)
+                            continue;
+
+                        if (!int.TryParse(item.ToString(), out int cableId))
+                            continue;
+
+                        if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
+                            overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                    }
+                }
+                else if (int.TryParse(value.ToString(), out int oneId))
+                {
+                    if (CableIdToFabricSpeed.TryGetValue(oneId, out float speed))
+                        overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                }
+
+                if (overrideSpeed > __0)
+                    __0 = overrideSpeed;
             }
             catch
             {
@@ -998,5 +1154,16 @@ namespace AutoSwitch
         public float EstimatedCapacityGbps;
 
         public int TotalPorts => QsfpPortCount + SfpPortCount;
+    }
+
+    internal sealed class CableRegistrationInfo
+    {
+        public int CableId;
+        public string DeviceA;
+        public string DeviceB;
+        public string ExtraA;
+        public string ExtraB;
+        public int PortA;
+        public int PortB;
     }
 }
