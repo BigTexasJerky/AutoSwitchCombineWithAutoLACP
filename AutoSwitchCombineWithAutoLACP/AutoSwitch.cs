@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.15.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.15.1", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -79,12 +79,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.15.0 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.15.1 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.15.0 active. Strict remote switch identity mode.");
+            MelonLogger.Msg("[AutoSwitch] v2.15.1 active. Preserved switch-id remote identity mode.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -598,20 +598,20 @@ namespace AutoSwitch
             string endpointSwitchId,
             int port)
         {
-            string normalizedDevice = NormalizeRuntimeIdentity(deviceName);
-            string normalizedEndpointSwitch = NormalizeRuntimeIdentity(endpointSwitchId);
+            string preservedDevice = PreserveSwitchIdentity(deviceName);
+            string preservedEndpointSwitch = PreserveSwitchIdentity(endpointSwitchId);
             string normalizedExtra = NormalizeRuntimeIdentity(extraName);
 
-            if (!string.IsNullOrWhiteSpace(normalizedDevice))
+            if (!string.IsNullOrWhiteSpace(preservedDevice))
             {
-                LogRemoteResolution(cableId, localDeviceId, "deviceId", normalizedDevice, deviceName, extraName, endpointSwitchId, serverRootKey, port);
-                return normalizedDevice;
+                LogRemoteResolution(cableId, localDeviceId, "deviceId", preservedDevice, deviceName, extraName, endpointSwitchId, serverRootKey, port);
+                return preservedDevice;
             }
 
-            if (!string.IsNullOrWhiteSpace(normalizedEndpointSwitch))
+            if (!string.IsNullOrWhiteSpace(preservedEndpointSwitch))
             {
-                LogRemoteResolution(cableId, localDeviceId, "endpointSwitch", normalizedEndpointSwitch, deviceName, extraName, endpointSwitchId, serverRootKey, port);
-                return normalizedEndpointSwitch;
+                LogRemoteResolution(cableId, localDeviceId, "endpointSwitch", preservedEndpointSwitch, deviceName, extraName, endpointSwitchId, serverRootKey, port);
+                return preservedEndpointSwitch;
             }
 
             if (!string.IsNullOrWhiteSpace(serverRootKey))
@@ -628,6 +628,32 @@ namespace AutoSwitch
             }
 
             return string.Empty;
+        }
+
+        private static string PreserveSwitchIdentity(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return string.Empty;
+
+            string trimmed = raw.Trim();
+
+            if (LooksLikeSwitchIdentity(trimmed))
+                return trimmed;
+
+            return string.Empty;
+        }
+
+        private static bool LooksLikeSwitchIdentity(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+
+            string trimmed = raw.Trim();
+
+            return trimmed.StartsWith("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("Switch4xSFP", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("Switch16CU", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void LogRemoteResolution(
