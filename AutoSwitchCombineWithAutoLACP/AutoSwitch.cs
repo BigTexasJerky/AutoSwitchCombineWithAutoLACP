@@ -13,7 +13,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.2.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.3.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -72,6 +72,9 @@ namespace AutoSwitch
         private static readonly HashSet<string> LoggedPatches =
             new(StringComparer.OrdinalIgnoreCase);
 
+        private static readonly HashSet<string> LoggedServerRootMappings =
+            new(StringComparer.OrdinalIgnoreCase);
+
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
 
@@ -80,11 +83,11 @@ namespace AutoSwitch
             ClassInjector.RegisterTypeInIl2Cpp<FabricGroupTag>();
 
             Directory.CreateDirectory(DebugFolderPath);
-            File.WriteAllText(DebugLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] AutoSwitch 2.2 debug log started.{Environment.NewLine}");
+            File.WriteAllText(DebugLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] AutoSwitch 2.3 debug log started.{Environment.NewLine}");
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.2.0 active. Safe mode with normalized server bundles.");
+            MelonLogger.Msg("[AutoSwitch] v2.3.0 active. Safe mode with graph-based server root bundling.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -102,6 +105,7 @@ namespace AutoSwitch
             CableIdToFabricId.Clear();
             CableIdToOverrideSpeed.Clear();
             LastFabricSignatures.Clear();
+            LoggedServerRootMappings.Clear();
 
             LogToFile($"Scene loaded: {sceneName} ({buildIndex})");
         }
@@ -299,13 +303,17 @@ namespace AutoSwitch
                     ExtraA = (__9 ?? string.Empty).Trim(),
                     ExtraB = (__10 ?? string.Empty).Trim(),
                     PortA = __7,
-                    PortB = __8
+                    PortB = __8,
+                    EndpointObjectA = __3,
+                    EndpointObjectB = __4,
+                    ServerRootKeyA = ResolveServerRootKey(__3, __9, __5),
+                    ServerRootKeyB = ResolveServerRootKey(__4, __10, __6)
                 };
 
                 RegisteredCables[__0] = info;
 
                 LogToFile(
-                    $"REGISTER CABLE | cableId={info.CableId} | deviceA={info.DeviceA} | deviceB={info.DeviceB} | extraA={info.ExtraA} | extraB={info.ExtraB} | portA={info.PortA} | portB={info.PortB}"
+                    $"REGISTER CABLE | cableId={info.CableId} | deviceA={info.DeviceA} | deviceB={info.DeviceB} | extraA={info.ExtraA} | extraB={info.ExtraB} | serverRootA={info.ServerRootKeyA} | serverRootB={info.ServerRootKeyB} | portA={info.PortA} | portB={info.PortB}"
                 );
             }
             catch (Exception ex)
@@ -556,15 +564,11 @@ namespace AutoSwitch
                     CableIdToOverrideSpeed[cable.CableId] = fabricSpeed;
                 }
 
-                // 2. Server-facing bundle links using NORMALIZED server keys.
+                // 2. Server-facing bundle links using resolved SERVER ROOT keys from endpoint objects.
                 var serverBundles = new Dictionary<string, List<RegisteredCableInfo>>(StringComparer.OrdinalIgnoreCase);
 
                 foreach (RegisteredCableInfo cable in RegisteredCables.Values)
                 {
-                    string serverKey = GetNormalizedServerBundleKey(cable);
-                    if (string.IsNullOrWhiteSpace(serverKey))
-                        continue;
-
                     bool switchAIn = fabricDevices.Contains(cable.DeviceA);
                     bool switchBIn = fabricDevices.Contains(cable.DeviceB);
 
@@ -572,16 +576,20 @@ namespace AutoSwitch
                     if (switchAIn == switchBIn)
                         continue;
 
-                    if (!serverBundles.TryGetValue(serverKey, out List<RegisteredCableInfo> bundle))
+                    string serverRootKey = GetServerRootBundleKey(cable);
+                    if (string.IsNullOrWhiteSpace(serverRootKey))
+                        continue;
+
+                    if (!serverBundles.TryGetValue(serverRootKey, out List<RegisteredCableInfo> bundle))
                     {
                         bundle = new List<RegisteredCableInfo>();
-                        serverBundles[serverKey] = bundle;
+                        serverBundles[serverRootKey] = bundle;
                     }
 
                     bundle.Add(cable);
                 }
 
-                foreach ((string serverKey, List<RegisteredCableInfo> bundle) in serverBundles)
+                foreach ((string serverRootKey, List<RegisteredCableInfo> bundle) in serverBundles)
                 {
                     if (bundle.Count < 2)
                         continue;
@@ -596,7 +604,7 @@ namespace AutoSwitch
                     }
 
                     string cableList = string.Join(",", bundle.Select(x => x.CableId).OrderBy(x => x));
-                    LogToFile($"SERVER BUNDLE | fabricId={fabricId} | serverKey={serverKey} | cableCount={bundle.Count} | perCableGbps={perCableSpeed.ToString("0.##", CultureInfo.InvariantCulture)} | cableIds=[{cableList}]");
+                    LogToFile($"SERVER BUNDLE | fabricId={fabricId} | serverRoot={serverRootKey} | cableCount={bundle.Count} | perCableGbps={perCableSpeed.ToString("0.##", CultureInfo.InvariantCulture)} | cableIds=[{cableList}]");
                 }
 
                 foreach (RegisteredSwitchInfo sw in fabric)
@@ -608,20 +616,29 @@ namespace AutoSwitch
             }
         }
 
-        private static string GetNormalizedServerBundleKey(RegisteredCableInfo cable)
+        private static string GetServerRootBundleKey(RegisteredCableInfo cable)
+        {
+            if (!string.IsNullOrWhiteSpace(cable.ServerRootKeyA) && cable.ServerRootKeyA.StartsWith("SERVERROOT:", StringComparison.OrdinalIgnoreCase))
+                return cable.ServerRootKeyA;
+
+            if (!string.IsNullOrWhiteSpace(cable.ServerRootKeyB) && cable.ServerRootKeyB.StartsWith("SERVERROOT:", StringComparison.OrdinalIgnoreCase))
+                return cable.ServerRootKeyB;
+
+            // fallback to a weaker normalized server family key if root discovery failed
+            string fallback = GetNormalizedServerFamilyKey(cable);
+            if (!string.IsNullOrWhiteSpace(fallback))
+                return $"SERVERFAMILY:{fallback}";
+
+            return string.Empty;
+        }
+
+        private static string GetNormalizedServerFamilyKey(RegisteredCableInfo cable)
         {
             string raw = GetServerEndpointName(cable);
             if (string.IsNullOrWhiteSpace(raw))
                 return string.Empty;
 
-            string normalized = raw.Trim();
-
-            // Convert:
-            // Server.Yellow2_-96608 -> Server.Yellow2
-            // Server.Blue2_-1898036 -> Server.Blue2
-            normalized = TrailingRuntimeIdRegex.Replace(normalized, "");
-
-            return normalized;
+            return TrailingRuntimeIdRegex.Replace(raw.Trim(), "");
         }
 
         private static string GetServerEndpointName(RegisteredCableInfo cable)
@@ -637,6 +654,40 @@ namespace AutoSwitch
 
             if (!string.IsNullOrWhiteSpace(cable.DeviceB) && cable.DeviceB.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
                 return cable.DeviceB;
+
+            return string.Empty;
+        }
+
+        private static string ResolveServerRootKey(object endpointObj, string extraName, string deviceName)
+        {
+            GameObject endpointGo = DiscoverGameObject(endpointObj);
+            if (endpointGo != null)
+            {
+                Transform current = endpointGo.transform;
+                int depth = 0;
+
+                while (current != null && depth < 16)
+                {
+                    string n = NormalizeCloneName(current.name);
+                    if (n.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string key = $"SERVERROOT:{n}#{current.gameObject.GetInstanceID()}";
+                        if (LoggedServerRootMappings.Add($"{endpointGo.GetInstanceID()}->{key}"))
+                            LogToFile($"SERVER ROOT MAP | endpoint={endpointGo.name} | root={current.name} | key={key}");
+                        return key;
+                    }
+
+                    current = current.parent;
+                    depth++;
+                }
+            }
+
+            string raw = !string.IsNullOrWhiteSpace(extraName) ? extraName : deviceName;
+            if (!string.IsNullOrWhiteSpace(raw) && raw.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+            {
+                string normalized = TrailingRuntimeIdRegex.Replace(raw.Trim(), "");
+                return $"SERVERFAMILY:{normalized}";
+            }
 
             return string.Empty;
         }
@@ -694,6 +745,15 @@ namespace AutoSwitch
         {
             if (obj == null)
                 return null;
+
+            try
+            {
+                if (obj is GameObject go)
+                    return go;
+            }
+            catch
+            {
+            }
 
             try
             {
@@ -963,5 +1023,11 @@ namespace AutoSwitch
         public string ExtraB;
         public int PortA;
         public int PortB;
+
+        public object EndpointObjectA;
+        public object EndpointObjectB;
+
+        public string ServerRootKeyA;
+        public string ServerRootKeyB;
     }
 }
