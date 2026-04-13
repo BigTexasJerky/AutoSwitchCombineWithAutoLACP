@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.16.2", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.17.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -72,7 +72,7 @@ namespace AutoSwitch
         private static readonly HashSet<string> LoggedCrossFabricSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly HashSet<string> LoggedUnknownRemotePassThroughSignatures =
+        private static readonly HashSet<string> LoggedUnknownRemoteCandidateSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private float _nextScanTime;
@@ -85,12 +85,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.16.2 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.17.0 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.16.2 active. Unknown remote switches pass-through mode.");
+            MelonLogger.Msg("[AutoSwitch] v2.17.0 active. Fabric-to-remote bundle mode.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -108,7 +108,7 @@ namespace AutoSwitch
             LoggedBundleSignatures.Clear();
             LoggedRemoteResolutionSignatures.Clear();
             LoggedCrossFabricSignatures.Clear();
-            LoggedUnknownRemotePassThroughSignatures.Clear();
+            LoggedUnknownRemoteCandidateSignatures.Clear();
 
             SaveDataAutoLACP.ResetForScene();
             SaveDataAutoLACP.StartSafeBootstrap();
@@ -175,8 +175,8 @@ namespace AutoSwitch
             int crossFabricSkipCount = 0;
             HashSet<int> crossFabricSkippedCableIds = new HashSet<int>();
 
-            int unknownRemotePassThroughCount = 0;
-            HashSet<int> unknownRemotePassThroughCableIds = new HashSet<int>();
+            int unknownRemoteCandidateCount = 0;
+            HashSet<int> unknownRemoteCandidateCableIds = new HashSet<int>();
 
             int fabricIndex = 1;
 
@@ -203,15 +203,16 @@ namespace AutoSwitch
                         externalLacpCableIds,
                         ref crossFabricSkipCount,
                         crossFabricSkippedCableIds,
-                        ref unknownRemotePassThroughCount,
-                        unknownRemotePassThroughCableIds);
+                        ref unknownRemoteCandidateCount,
+                        unknownRemoteCandidateCableIds);
 
                 List<int> fabricCableIds = new List<int>();
 
-                foreach (BundleBuilder bundle in bundlesForFabric.Values.OrderBy(b => b.LocalDeviceId).ThenBy(b => b.RemoteDeviceId))
+                foreach (BundleBuilder bundle in bundlesForFabric.Values.OrderBy(b => b.OwnerLocalDeviceId).ThenBy(b => b.RemoteDeviceId))
                 {
                     bundle.FabricId = fabricId;
                     bundle.FabricEstimatedSpeedGbps = fabricSpeed;
+                    bundle.RefreshOwner();
 
                     List<int> distinctIds = bundle.CableIds.Distinct().OrderBy(x => x).ToList();
                     if (distinctIds.Count >= 2)
@@ -221,17 +222,20 @@ namespace AutoSwitch
 
                         allBundles.Add(bundle);
 
+                        string localMembers = string.Join(",", bundle.LocalMemberIds.OrderBy(x => x));
                         string signature =
                             fabricId + "|" +
-                            bundle.LocalDeviceId + "|" +
+                            bundle.OwnerLocalDeviceId + "|" +
                             bundle.RemoteDeviceId + "|" +
+                            localMembers + "|" +
                             string.Join(",", distinctIds);
 
                         if (LoggedBundleSignatures.Add(signature))
                         {
                             LogToFile(
-                                "LIVE BUNDLE | fabricId=" + fabricId +
-                                " | local=" + bundle.LocalDeviceId +
+                                "LIVE FABRIC BUNDLE | fabricId=" + fabricId +
+                                " | ownerLocal=" + bundle.OwnerLocalDeviceId +
+                                " | localMembers=[" + localMembers + "]" +
                                 " | remote=" + bundle.RemoteDeviceId +
                                 " | cableCount=" + distinctIds.Count.ToString(CultureInfo.InvariantCulture) +
                                 " | estPerCableGbps=" + (fabricSpeed / distinctIds.Count).ToString("0.##", CultureInfo.InvariantCulture) +
@@ -254,7 +258,7 @@ namespace AutoSwitch
                 " | saveCables=" + saveCableCount.ToString(CultureInfo.InvariantCulture) +
                 " | externalLacpCableIds=" + externalLacpCableIds.Count.ToString(CultureInfo.InvariantCulture) +
                 " | crossFabricSkipped=" + crossFabricSkipCount.ToString(CultureInfo.InvariantCulture) +
-                " | unknownRemotePassThrough=" + unknownRemotePassThroughCount.ToString(CultureInfo.InvariantCulture) +
+                " | unknownRemoteCandidates=" + unknownRemoteCandidateCount.ToString(CultureInfo.InvariantCulture) +
                 " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture) +
                 " | activeFabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) +
                 " | adjacentPairs=" + adjacencyPairs.ToString(CultureInfo.InvariantCulture) +
@@ -273,8 +277,8 @@ namespace AutoSwitch
                 if (crossFabricSkippedCableIds.Count > 0)
                     LogToFile("CROSS FABRIC SKIPPED CABLE IDS | [" + string.Join(",", crossFabricSkippedCableIds.OrderBy(x => x)) + "]");
 
-                if (unknownRemotePassThroughCableIds.Count > 0)
-                    LogToFile("UNKNOWN REMOTE PASS-THROUGH CABLE IDS | [" + string.Join(",", unknownRemotePassThroughCableIds.OrderBy(x => x)) + "]");
+                if (unknownRemoteCandidateCableIds.Count > 0)
+                    LogToFile("UNKNOWN REMOTE CANDIDATE CABLE IDS | [" + string.Join(",", unknownRemoteCandidateCableIds.OrderBy(x => x)) + "]");
 
                 int logIndex = 1;
                 foreach (List<RegisteredSwitchInfo> fabric in fabrics)
@@ -546,8 +550,8 @@ namespace AutoSwitch
             HashSet<int> externalLacpCableIds,
             ref int crossFabricSkipCount,
             HashSet<int> crossFabricSkippedCableIds,
-            ref int unknownRemotePassThroughCount,
-            HashSet<int> unknownRemotePassThroughCableIds)
+            ref int unknownRemoteCandidateCount,
+            HashSet<int> unknownRemoteCandidateCableIds)
         {
             Dictionary<string, BundleBuilder> result =
                 new Dictionary<string, BundleBuilder>(StringComparer.OrdinalIgnoreCase);
@@ -587,24 +591,26 @@ namespace AutoSwitch
                     }
                     else
                     {
-                        unknownRemotePassThroughCount++;
-                        unknownRemotePassThroughCableIds.Add(cable.CableId);
-                        LogUnknownRemotePassThrough(cable.CableId, currentFabricId, localDeviceId, remoteDeviceId);
-                        continue;
+                        unknownRemoteCandidateCount++;
+                        unknownRemoteCandidateCableIds.Add(cable.CableId);
+                        LogUnknownRemoteCandidate(cable.CableId, currentFabricId, localDeviceId, remoteDeviceId);
                     }
                 }
 
-                string key = localDeviceId + "||" + remoteDeviceId;
+                string key = currentFabricId + "||" + remoteDeviceId;
                 BundleBuilder builder;
                 if (!result.TryGetValue(key, out builder))
                 {
                     builder = new BundleBuilder();
-                    builder.LocalDeviceId = localDeviceId;
+                    builder.FabricId = currentFabricId;
                     builder.RemoteDeviceId = remoteDeviceId;
                     result[key] = builder;
                 }
 
                 builder.CableIds.Add(cable.CableId);
+                builder.LocalMemberIds.Add(localDeviceId);
+                builder.RefreshOwner();
+
                 globallyClaimedCableIds.Add(cable.CableId);
             }
 
@@ -637,7 +643,7 @@ namespace AutoSwitch
             );
         }
 
-        private static void LogUnknownRemotePassThrough(
+        private static void LogUnknownRemoteCandidate(
             int cableId,
             string localFabricId,
             string localDeviceId,
@@ -649,11 +655,11 @@ namespace AutoSwitch
                 localDeviceId + "|" +
                 remoteDeviceId;
 
-            if (!LoggedUnknownRemotePassThroughSignatures.Add(signature))
+            if (!LoggedUnknownRemoteCandidateSignatures.Add(signature))
                 return;
 
             LogToFile(
-                "UNKNOWN REMOTE PASS-THROUGH | cableId=" + cableId.ToString(CultureInfo.InvariantCulture) +
+                "UNKNOWN REMOTE CANDIDATE | cableId=" + cableId.ToString(CultureInfo.InvariantCulture) +
                 " | localFabric=" + localFabricId +
                 " | localDevice=" + localDeviceId +
                 " | remoteDevice=" + remoteDeviceId
@@ -1345,7 +1351,7 @@ namespace AutoSwitch
                 _desiredBundles = bundles
                     .Select(CloneBundle)
                     .OrderBy(b => b.FabricId)
-                    .ThenBy(b => b.LocalDeviceId)
+                    .ThenBy(b => b.OwnerLocalDeviceId)
                     .ThenBy(b => b.RemoteDeviceId)
                     .ToList();
 
@@ -1468,6 +1474,8 @@ namespace AutoSwitch
 
             foreach (BundleBuilder bundle in desiredBundles)
             {
+                bundle.RefreshOwner();
+
                 List<int> distinctIds = bundle.CableIds.Distinct().OrderBy(x => x).ToList();
                 if (distinctIds.Count < 2)
                     continue;
@@ -1478,7 +1486,7 @@ namespace AutoSwitch
                     foreach (int cableId in distinctIds)
                         il2cppCableIds.Add(cableId);
 
-                    int groupId = networkMap.CreateLACPGroup(bundle.LocalDeviceId, bundle.RemoteDeviceId, il2cppCableIds);
+                    int groupId = networkMap.CreateLACPGroup(bundle.OwnerLocalDeviceId, bundle.RemoteDeviceId, il2cppCableIds);
                     _ownedGroupIds.Add(groupId);
 
                     if (networkSaveData != null)
@@ -1487,29 +1495,41 @@ namespace AutoSwitch
                         {
                             LACPGroupSaveData saveGroup = new LACPGroupSaveData();
                             saveGroup.groupId = groupId;
-                            saveGroup.deviceA = bundle.LocalDeviceId;
+                            saveGroup.deviceA = bundle.OwnerLocalDeviceId;
                             saveGroup.deviceB = bundle.RemoteDeviceId;
                             saveGroup.cableIds = il2cppCableIds;
                             rebuiltSaveGroups.Add(saveGroup);
                         }
                         catch (Exception ex)
                         {
-                            AutoSwitchMod.LogToFile("AUTO LACP | save group construct failed for " +
-                                                    bundle.LocalDeviceId + " -> " + bundle.RemoteDeviceId + " | " + ex.Message);
+                            AutoSwitchMod.LogToFile(
+                                "AUTO LACP | save group construct failed for fabricId=" + bundle.FabricId +
+                                " | ownerLocal=" + bundle.OwnerLocalDeviceId +
+                                " | remote=" + bundle.RemoteDeviceId +
+                                " | " + ex.Message
+                            );
                         }
                     }
 
-                    AutoSwitchMod.LogToFile("AUTO LACP | created groupId=" + groupId.ToString(CultureInfo.InvariantCulture) +
-                                            " | fabricId=" + bundle.FabricId +
-                                            " | deviceA=" + bundle.LocalDeviceId +
-                                            " | deviceB=" + bundle.RemoteDeviceId +
-                                            " | cableIds=[" + string.Join(",", distinctIds) + "]");
+                    AutoSwitchMod.LogToFile(
+                        "AUTO LACP | created groupId=" + groupId.ToString(CultureInfo.InvariantCulture) +
+                        " | fabricId=" + bundle.FabricId +
+                        " | ownerLocal=" + bundle.OwnerLocalDeviceId +
+                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x)) + "]" +
+                        " | deviceB=" + bundle.RemoteDeviceId +
+                        " | cableIds=[" + string.Join(",", distinctIds) + "]"
+                    );
                 }
                 catch (Exception ex)
                 {
-                    AutoSwitchMod.LogToFile("AUTO LACP | CreateLACPGroup failed | deviceA=" + bundle.LocalDeviceId +
-                                            " | deviceB=" + bundle.RemoteDeviceId +
-                                            " | " + ex);
+                    AutoSwitchMod.LogToFile(
+                        "AUTO LACP | CreateLACPGroup failed | fabricId=" + bundle.FabricId +
+                        " | ownerLocal=" + bundle.OwnerLocalDeviceId +
+                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x)) + "]" +
+                        " | deviceB=" + bundle.RemoteDeviceId +
+                        " | cableIds=[" + string.Join(",", distinctIds) + "]" +
+                        " | " + ex
+                    );
                 }
             }
 
@@ -1531,10 +1551,12 @@ namespace AutoSwitch
                 }
             }
 
-            AutoSwitchMod.LogToFile("AUTO LACP | regroup complete | removed=" +
-                                    removedGroupIds.Distinct().Count().ToString(CultureInfo.InvariantCulture) +
-                                    " | desiredBundles=" + desiredBundles.Count.ToString(CultureInfo.InvariantCulture) +
-                                    " | ownedNow=" + _ownedGroupIds.Count.ToString(CultureInfo.InvariantCulture));
+            AutoSwitchMod.LogToFile(
+                "AUTO LACP | regroup complete | removed=" +
+                removedGroupIds.Distinct().Count().ToString(CultureInfo.InvariantCulture) +
+                " | desiredBundles=" + desiredBundles.Count.ToString(CultureInfo.InvariantCulture) +
+                " | ownedNow=" + _ownedGroupIds.Count.ToString(CultureInfo.InvariantCulture)
+            );
         }
 
         private static string BuildDesiredSignature(List<BundleBuilder> bundles, HashSet<string> managedIds)
@@ -1543,13 +1565,18 @@ namespace AutoSwitch
 
             foreach (BundleBuilder bundle in bundles
                 .OrderBy(b => b.FabricId)
-                .ThenBy(b => b.LocalDeviceId)
+                .ThenBy(b => b.OwnerLocalDeviceId)
                 .ThenBy(b => b.RemoteDeviceId))
             {
-                parts.Add(bundle.FabricId + "|" +
-                          bundle.LocalDeviceId + "|" +
-                          bundle.RemoteDeviceId + "|" +
-                          string.Join(",", bundle.CableIds.Distinct().OrderBy(x => x)));
+                bundle.RefreshOwner();
+
+                parts.Add(
+                    bundle.FabricId + "|" +
+                    bundle.OwnerLocalDeviceId + "|" +
+                    bundle.RemoteDeviceId + "|" +
+                    string.Join(",", bundle.LocalMemberIds.OrderBy(x => x)) + "|" +
+                    string.Join(",", bundle.CableIds.Distinct().OrderBy(x => x))
+                );
             }
 
             parts.Add("managed:" + string.Join(",", managedIds.OrderBy(x => x)));
@@ -1562,12 +1589,16 @@ namespace AutoSwitch
             BundleBuilder clone = new BundleBuilder();
             clone.FabricId = source.FabricId;
             clone.FabricEstimatedSpeedGbps = source.FabricEstimatedSpeedGbps;
-            clone.LocalDeviceId = source.LocalDeviceId;
+            clone.OwnerLocalDeviceId = source.OwnerLocalDeviceId;
             clone.RemoteDeviceId = source.RemoteDeviceId;
+
+            foreach (string id in source.LocalMemberIds)
+                clone.LocalMemberIds.Add(id);
 
             foreach (int cableId in source.CableIds)
                 clone.CableIds.Add(cableId);
 
+            clone.RefreshOwner();
             return clone;
         }
     }
@@ -1618,8 +1649,20 @@ namespace AutoSwitch
     {
         public string FabricId;
         public float FabricEstimatedSpeedGbps;
-        public string LocalDeviceId;
+        public string OwnerLocalDeviceId;
         public string RemoteDeviceId;
         public readonly List<int> CableIds = new List<int>();
+        public readonly HashSet<string> LocalMemberIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        public void RefreshOwner()
+        {
+            if (LocalMemberIds.Count == 0)
+            {
+                OwnerLocalDeviceId = string.Empty;
+                return;
+            }
+
+            OwnerLocalDeviceId = LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).First();
+        }
     }
 }
