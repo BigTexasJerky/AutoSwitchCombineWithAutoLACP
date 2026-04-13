@@ -9,10 +9,11 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.0.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.2.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -21,10 +22,17 @@ namespace AutoSwitch
     {
         private const float ScanIntervalSeconds = 6.0f;
 
-        // Registry-first world adjacency thresholds.
         private const float SameFabricXZTolerance = 0.40f;
         private const float AdjacentYTolerance = 0.040f;
         private const float FallbackExpectedStep = 0.0444f;
+
+        // Safe-mode junk filters
+        private const float OriginXZRejectRadius = 1.25f;
+        private const float MinUsefulWorldY = 1.0f;
+        private const float MaxUsefulWorldY = 4.5f;
+
+        private static readonly Regex TrailingRuntimeIdRegex =
+            new(@"_[\-]?\d+$", RegexOptions.Compiled);
 
         private static string DebugFolderPath =>
             Path.Combine(MelonEnvironment.ModsDirectory, "AutoSwitch");
@@ -55,7 +63,7 @@ namespace AutoSwitch
         private static readonly Dictionary<int, string> CableIdToFabricId =
             new();
 
-        private static readonly Dictionary<int, float> CableIdToFabricSpeed =
+        private static readonly Dictionary<int, float> CableIdToOverrideSpeed =
             new();
 
         private static readonly Dictionary<string, string> LastFabricSignatures =
@@ -72,11 +80,11 @@ namespace AutoSwitch
             ClassInjector.RegisterTypeInIl2Cpp<FabricGroupTag>();
 
             Directory.CreateDirectory(DebugFolderPath);
-            File.WriteAllText(DebugLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] AutoSwitch 2.0 debug log started.{Environment.NewLine}");
+            File.WriteAllText(DebugLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] AutoSwitch 2.2 debug log started.{Environment.NewLine}");
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.0.0 active. Registry-first switch/cable fabric mode.");
+            MelonLogger.Msg("[AutoSwitch] v2.2.0 active. Safe mode with normalized server bundles.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -92,7 +100,7 @@ namespace AutoSwitch
             FabricIdToSpeed.Clear();
             FabricIdToCableIds.Clear();
             CableIdToFabricId.Clear();
-            CableIdToFabricSpeed.Clear();
+            CableIdToOverrideSpeed.Clear();
             LastFabricSignatures.Clear();
 
             LogToFile($"Scene loaded: {sceneName} ({buildIndex})");
@@ -106,7 +114,7 @@ namespace AutoSwitch
                     return;
 
                 _nextScanTime = Time.time + ScanIntervalSeconds;
-                RunRegistryFirstFabricPass();
+                RunSafeModeFabricPass();
             }
             catch (Exception ex)
             {
@@ -116,12 +124,13 @@ namespace AutoSwitch
             }
         }
 
-        private void RunRegistryFirstFabricPass()
+        private void RunSafeModeFabricPass()
         {
             RefreshRegisteredSwitchPositions();
 
             List<RegisteredSwitchInfo> liveSwitches = RegisteredSwitches.Values
                 .Where(s => s != null && s.HasWorldPosition && IsAllowedSwitchModel(s.ModelName))
+                .Where(IsLikelyPlacedSwitch)
                 .ToList();
 
             List<List<RegisteredSwitchInfo>> fabrics = BuildRegistryFabrics(liveSwitches)
@@ -130,12 +139,12 @@ namespace AutoSwitch
                 .ThenByDescending(f => f.Sum(x => x.EstimatedCapacityGbps))
                 .ToList();
 
-            ApplyRegistryFabrics(fabrics);
+            ApplySafeModeFabrics(fabrics);
 
             int adjacencyPairs = fabrics.Sum(f => Math.Max(0, f.Count - 1));
 
             string summary =
-                $"SCAN SUMMARY | registeredSwitches={RegisteredSwitches.Count} | registeredCables={RegisteredCables.Count} | liveSwitches={liveSwitches.Count} | activeFabrics={fabrics.Count} | adjacentPairs={adjacencyPairs} | trackedCableIds={CableIdToFabricSpeed.Count}";
+                $"SCAN SUMMARY | registeredSwitches={RegisteredSwitches.Count} | registeredCables={RegisteredCables.Count} | liveSwitches={liveSwitches.Count} | activeFabrics={fabrics.Count} | adjacentPairs={adjacencyPairs} | trackedCableIds={CableIdToOverrideSpeed.Count}";
 
             if (!string.Equals(summary, _lastSummary, StringComparison.Ordinal))
             {
@@ -202,16 +211,6 @@ namespace AutoSwitch
                         );
                         LogPatch("Patched NetworkMap.CreateLACPGroup");
                     }
-
-                    MethodInfo updateServerSpeed = AccessTools.Method(networkMapType, "UpdateCustomerServerCountAndSpeed");
-                    if (updateServerSpeed != null)
-                    {
-                        HarmonyInstance.Patch(
-                            updateServerSpeed,
-                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static))
-                        );
-                        LogPatch("Patched NetworkMap.UpdateCustomerServerCountAndSpeed");
-                    }
                 }
 
                 Type lacpGroupType = AccessTools.TypeByName("Il2Cpp.NetworkMap+LACPGroup");
@@ -247,6 +246,7 @@ namespace AutoSwitch
                 LogToFile($"InstallNativePatches failed: {ex}");
             }
         }
+
         private static void LogPatch(string message)
         {
             if (LoggedPatches.Add(message))
@@ -321,17 +321,14 @@ namespace AutoSwitch
                 List<int> cableIds = ExtractIntList(__2);
                 string joined = string.Join(",", cableIds.OrderBy(x => x));
 
-                LogToFile($"CREATE LACP | groupId={__result} | deviceA={__0} | deviceB={__1} | cableIds=[{joined}]");
-
-                float overrideSpeed = 0f;
+                float sumSpeed = 0f;
                 foreach (int cableId in cableIds)
                 {
-                    if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
-                        overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                    if (CableIdToOverrideSpeed.TryGetValue(cableId, out float speed))
+                        sumSpeed += speed;
                 }
 
-                if (overrideSpeed > 0f)
-                    LogToFile($"CREATE LACP SPEED HINT | groupId={__result} | overrideSpeed={overrideSpeed.ToString("0.##", CultureInfo.InvariantCulture)}");
+                LogToFile($"CREATE LACP | groupId={__result} | deviceA={__0} | deviceB={__1} | cableIds=[{joined}] | overrideSum={sumSpeed.ToString("0.##", CultureInfo.InvariantCulture)}");
             }
             catch (Exception ex)
             {
@@ -349,15 +346,15 @@ namespace AutoSwitch
                 object raw = TryGetMemberValue(__instance, "cableIds");
                 List<int> cableIds = ExtractIntList(raw);
 
-                float overrideSpeed = 0f;
+                float overrideSum = 0f;
                 foreach (int cableId in cableIds)
                 {
-                    if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
-                        overrideSpeed = Mathf.Max(overrideSpeed, speed);
+                    if (CableIdToOverrideSpeed.TryGetValue(cableId, out float speed))
+                        overrideSum += speed;
                 }
 
-                if (overrideSpeed > __result)
-                    __result = overrideSpeed;
+                if (overrideSum > __result)
+                    __result = overrideSum;
             }
             catch
             {
@@ -374,31 +371,18 @@ namespace AutoSwitch
                 object raw = TryGetMemberValue(__instance, "cableIDsOnLink");
                 List<int> cableIds = ExtractIntList(raw);
 
+                if (cableIds.Count == 0)
+                    return;
+
                 float overrideSpeed = 0f;
                 foreach (int cableId in cableIds)
                 {
-                    if (CableIdToFabricSpeed.TryGetValue(cableId, out float speed))
+                    if (CableIdToOverrideSpeed.TryGetValue(cableId, out float speed))
                         overrideSpeed = Mathf.Max(overrideSpeed, speed);
                 }
 
                 if (overrideSpeed > __0)
                     __0 = overrideSpeed;
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix(ref float __2)
-        {
-            try
-            {
-                if (FabricIdToSpeed.Count == 0)
-                    return;
-
-                float maxFabricSpeed = FabricIdToSpeed.Values.Max();
-                if (maxFabricSpeed > __2)
-                    __2 = maxFabricSpeed;
             }
             catch
             {
@@ -459,6 +443,21 @@ namespace AutoSwitch
             return AllowedSwitchModels.Contains(normalized);
         }
 
+        private static bool IsLikelyPlacedSwitch(RegisteredSwitchInfo info)
+        {
+            if (info == null || !info.HasWorldPosition)
+                return false;
+
+            float xzRadius = Mathf.Sqrt((info.WorldPosition.x * info.WorldPosition.x) + (info.WorldPosition.z * info.WorldPosition.z));
+            if (xzRadius <= OriginXZRejectRadius)
+                return false;
+
+            if (info.WorldPosition.y < MinUsefulWorldY || info.WorldPosition.y > MaxUsefulWorldY)
+                return false;
+
+            return true;
+        }
+
         private static float EstimateCapacityFromModel(string modelName)
         {
             string normalized = NormalizeCloneName(modelName);
@@ -514,54 +513,132 @@ namespace AutoSwitch
             return groups;
         }
 
-        private void ApplyRegistryFabrics(List<List<RegisteredSwitchInfo>> fabrics)
+        private void ApplySafeModeFabrics(List<List<RegisteredSwitchInfo>> fabrics)
         {
             FabricIdToSpeed.Clear();
             FabricIdToCableIds.Clear();
             CableIdToFabricId.Clear();
-            CableIdToFabricSpeed.Clear();
+            CableIdToOverrideSpeed.Clear();
 
             int index = 1;
 
             foreach (List<RegisteredSwitchInfo> fabric in fabrics)
             {
                 string fabricId = $"FABRIC-{index:000}";
-                float speed = fabric.Sum(x => x.EstimatedCapacityGbps);
+                float fabricSpeed = fabric.Sum(x => x.EstimatedCapacityGbps);
 
-                FabricIdToSpeed[fabricId] = speed;
+                FabricIdToSpeed[fabricId] = fabricSpeed;
                 FabricIdToCableIds[fabricId] = new HashSet<int>();
 
-                string signature = BuildFabricSignature(fabric, speed);
+                string signature = BuildFabricSignature(fabric, fabricSpeed);
                 if (!LastFabricSignatures.TryGetValue(fabricId, out string oldSig) ||
                     !string.Equals(oldSig, signature, StringComparison.Ordinal))
                 {
                     LastFabricSignatures[fabricId] = signature;
-                    LogToFile($"APPLY | fabricId={fabricId} | members={fabric.Count} | estCapacityGbps={speed.ToString("0.##", CultureInfo.InvariantCulture)}");
+                    LogToFile($"APPLY | fabricId={fabricId} | members={fabric.Count} | estCapacityGbps={fabricSpeed.ToString("0.##", CultureInfo.InvariantCulture)}");
                 }
 
-                HashSet<string> deviceNames = new(fabric.Select(x => x.DeviceName).Where(x => !string.IsNullOrWhiteSpace(x)),
+                HashSet<string> fabricDevices = new(
+                    fabric.Select(x => x.DeviceName).Where(x => !string.IsNullOrWhiteSpace(x)),
                     StringComparer.OrdinalIgnoreCase);
 
+                // 1. Internal switch-switch links only when BOTH ends are inside the same fabric.
                 foreach (RegisteredCableInfo cable in RegisteredCables.Values)
                 {
-                    bool aIn = deviceNames.Contains(cable.DeviceA);
-                    bool bIn = deviceNames.Contains(cable.DeviceB);
+                    bool aIn = fabricDevices.Contains(cable.DeviceA);
+                    bool bIn = fabricDevices.Contains(cable.DeviceB);
 
-                    if (!(aIn || bIn))
+                    if (!(aIn && bIn))
                         continue;
 
                     FabricIdToCableIds[fabricId].Add(cable.CableId);
                     CableIdToFabricId[cable.CableId] = fabricId;
-                    CableIdToFabricSpeed[cable.CableId] = speed;
+                    CableIdToOverrideSpeed[cable.CableId] = fabricSpeed;
+                }
+
+                // 2. Server-facing bundle links using NORMALIZED server keys.
+                var serverBundles = new Dictionary<string, List<RegisteredCableInfo>>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (RegisteredCableInfo cable in RegisteredCables.Values)
+                {
+                    string serverKey = GetNormalizedServerBundleKey(cable);
+                    if (string.IsNullOrWhiteSpace(serverKey))
+                        continue;
+
+                    bool switchAIn = fabricDevices.Contains(cable.DeviceA);
+                    bool switchBIn = fabricDevices.Contains(cable.DeviceB);
+
+                    // exactly one switch endpoint should be in the fabric for a server-facing cable
+                    if (switchAIn == switchBIn)
+                        continue;
+
+                    if (!serverBundles.TryGetValue(serverKey, out List<RegisteredCableInfo> bundle))
+                    {
+                        bundle = new List<RegisteredCableInfo>();
+                        serverBundles[serverKey] = bundle;
+                    }
+
+                    bundle.Add(cable);
+                }
+
+                foreach ((string serverKey, List<RegisteredCableInfo> bundle) in serverBundles)
+                {
+                    if (bundle.Count < 2)
+                        continue;
+
+                    float perCableSpeed = fabricSpeed / bundle.Count;
+
+                    foreach (RegisteredCableInfo cable in bundle)
+                    {
+                        FabricIdToCableIds[fabricId].Add(cable.CableId);
+                        CableIdToFabricId[cable.CableId] = fabricId;
+                        CableIdToOverrideSpeed[cable.CableId] = perCableSpeed;
+                    }
+
+                    string cableList = string.Join(",", bundle.Select(x => x.CableId).OrderBy(x => x));
+                    LogToFile($"SERVER BUNDLE | fabricId={fabricId} | serverKey={serverKey} | cableCount={bundle.Count} | perCableGbps={perCableSpeed.ToString("0.##", CultureInfo.InvariantCulture)} | cableIds=[{cableList}]");
                 }
 
                 foreach (RegisteredSwitchInfo sw in fabric)
                 {
-                    ApplyTagToSwitch(sw, fabricId, fabric.Count, speed);
+                    ApplyTagToSwitch(sw, fabricId, fabric.Count, fabricSpeed);
                 }
 
                 index++;
             }
+        }
+
+        private static string GetNormalizedServerBundleKey(RegisteredCableInfo cable)
+        {
+            string raw = GetServerEndpointName(cable);
+            if (string.IsNullOrWhiteSpace(raw))
+                return string.Empty;
+
+            string normalized = raw.Trim();
+
+            // Convert:
+            // Server.Yellow2_-96608 -> Server.Yellow2
+            // Server.Blue2_-1898036 -> Server.Blue2
+            normalized = TrailingRuntimeIdRegex.Replace(normalized, "");
+
+            return normalized;
+        }
+
+        private static string GetServerEndpointName(RegisteredCableInfo cable)
+        {
+            if (!string.IsNullOrWhiteSpace(cable.ExtraA) && cable.ExtraA.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                return cable.ExtraA;
+
+            if (!string.IsNullOrWhiteSpace(cable.ExtraB) && cable.ExtraB.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                return cable.ExtraB;
+
+            if (!string.IsNullOrWhiteSpace(cable.DeviceA) && cable.DeviceA.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                return cable.DeviceA;
+
+            if (!string.IsNullOrWhiteSpace(cable.DeviceB) && cable.DeviceB.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                return cable.DeviceB;
+
+            return string.Empty;
         }
 
         private static void ApplyTagToSwitch(RegisteredSwitchInfo sw, string fabricId, int memberCount, float speed)
@@ -830,46 +907,6 @@ namespace AutoSwitch
             }
         }
 
-        private void DumpNearMisses()
-        {
-            try
-            {
-                Transform[] allTransforms = UnityEngine.Object.FindObjectsOfType<Transform>();
-
-                LogToFile("NEAR MISS DUMP START");
-
-                int written = 0;
-                foreach (Transform t in allTransforms)
-                {
-                    if (t == null || t.gameObject == null)
-                        continue;
-
-                    string name = t.gameObject.name ?? string.Empty;
-                    string lower = name.ToLowerInvariant();
-
-                    if (!(lower.Contains("switch") || lower.Contains("qsfp") || lower.Contains("sfp")))
-                        continue;
-
-                    int qsfpCount = CountPorts(t.gameObject, "QSFP_port.");
-                    int sfpCount = CountPorts(t.gameObject, "SFP_port.");
-
-                    LogToFile(
-                        $"NEAR MISS | name={t.gameObject.name} | normalized={NormalizeCloneName(t.gameObject.name)} | parent={t.parent?.name ?? "<root>"} | chain={BuildParentChain(t, 6)} | qsfp={qsfpCount} | sfp={sfpCount}"
-                    );
-
-                    written++;
-                    if (written >= 60)
-                        break;
-                }
-
-                LogToFile("NEAR MISS DUMP END");
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"DumpNearMisses failed: {ex}");
-            }
-        }
-
         private static string NormalizeCloneName(string name)
         {
             if (string.IsNullOrWhiteSpace(name))
@@ -880,45 +917,6 @@ namespace AutoSwitch
                 result = result.Substring(0, result.Length - "(Clone)".Length).Trim();
 
             return result;
-        }
-
-        private static int CountPorts(GameObject go, string prefix)
-        {
-            int count = 0;
-
-            foreach (Transform t in go.GetComponentsInChildren<Transform>(true))
-            {
-                if (t == null)
-                    continue;
-
-                string n = t.name ?? string.Empty;
-                if (n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                    count++;
-            }
-
-            return count;
-        }
-
-        private static string BuildParentChain(Transform t, int depth)
-        {
-            if (t == null)
-                return "<null>";
-
-            List<string> parts = new();
-            Transform current = t.parent;
-            int count = 0;
-
-            while (current != null && count < depth)
-            {
-                parts.Add(current.name);
-                current = current.parent;
-                count++;
-            }
-
-            if (parts.Count == 0)
-                return "<root>";
-
-            return string.Join(" <- ", parts);
         }
 
         private static void LogToFile(string message)
