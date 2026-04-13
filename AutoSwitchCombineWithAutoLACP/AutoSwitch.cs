@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.15.1", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.16.2", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -69,6 +69,12 @@ namespace AutoSwitch
         private static readonly HashSet<string> LoggedRemoteResolutionSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        private static readonly HashSet<string> LoggedCrossFabricSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedUnknownRemotePassThroughSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
 
@@ -79,12 +85,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.15.1 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.16.2 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.15.1 active. Preserved switch-id remote identity mode.");
+            MelonLogger.Msg("[AutoSwitch] v2.16.2 active. Unknown remote switches pass-through mode.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -101,6 +107,8 @@ namespace AutoSwitch
             FabricIdToBundleCableIds.Clear();
             LoggedBundleSignatures.Clear();
             LoggedRemoteResolutionSignatures.Clear();
+            LoggedCrossFabricSignatures.Clear();
+            LoggedUnknownRemotePassThroughSignatures.Clear();
 
             SaveDataAutoLACP.ResetForScene();
             SaveDataAutoLACP.StartSafeBootstrap();
@@ -141,6 +149,17 @@ namespace AutoSwitch
                 .ThenByDescending(f => f.Sum(x => x.EstimatedCapacityGbps))
                 .ToList();
 
+            Dictionary<string, string> deviceIdToFabricId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < fabrics.Count; i++)
+            {
+                string fabricId = "FABRIC-" + (i + 1).ToString("000", CultureInfo.InvariantCulture);
+                foreach (RegisteredSwitchInfo sw in fabrics[i])
+                {
+                    if (sw != null && !string.IsNullOrWhiteSpace(sw.DeviceName))
+                        deviceIdToFabricId[sw.DeviceName] = fabricId;
+                }
+            }
+
             NetworkSaveData networkSaveData = GetNetworkSaveData();
             int saveCableCount = CountSaveCables(networkSaveData);
 
@@ -152,6 +171,12 @@ namespace AutoSwitch
             List<BundleBuilder> allBundles = new List<BundleBuilder>();
             HashSet<string> allManagedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<int> globallyClaimedCableIds = new HashSet<int>();
+
+            int crossFabricSkipCount = 0;
+            HashSet<int> crossFabricSkippedCableIds = new HashSet<int>();
+
+            int unknownRemotePassThroughCount = 0;
+            HashSet<int> unknownRemotePassThroughCableIds = new HashSet<int>();
 
             int fabricIndex = 1;
 
@@ -170,7 +195,16 @@ namespace AutoSwitch
                     allManagedIds.Add(localId);
 
                 Dictionary<string, BundleBuilder> bundlesForFabric =
-                    BuildBundlesForFabricFromLiveRegistry(localIds, globallyClaimedCableIds, externalLacpCableIds);
+                    BuildBundlesForFabricFromLiveRegistry(
+                        fabricId,
+                        localIds,
+                        deviceIdToFabricId,
+                        globallyClaimedCableIds,
+                        externalLacpCableIds,
+                        ref crossFabricSkipCount,
+                        crossFabricSkippedCableIds,
+                        ref unknownRemotePassThroughCount,
+                        unknownRemotePassThroughCableIds);
 
                 List<int> fabricCableIds = new List<int>();
 
@@ -219,6 +253,8 @@ namespace AutoSwitch
                 " | registeredCables=" + RegisteredCables.Count.ToString(CultureInfo.InvariantCulture) +
                 " | saveCables=" + saveCableCount.ToString(CultureInfo.InvariantCulture) +
                 " | externalLacpCableIds=" + externalLacpCableIds.Count.ToString(CultureInfo.InvariantCulture) +
+                " | crossFabricSkipped=" + crossFabricSkipCount.ToString(CultureInfo.InvariantCulture) +
+                " | unknownRemotePassThrough=" + unknownRemotePassThroughCount.ToString(CultureInfo.InvariantCulture) +
                 " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture) +
                 " | activeFabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) +
                 " | adjacentPairs=" + adjacencyPairs.ToString(CultureInfo.InvariantCulture) +
@@ -233,6 +269,12 @@ namespace AutoSwitch
 
                 if (externalLacpCableIds.Count > 0)
                     LogToFile("EXTERNAL LACP CABLE IDS | [" + string.Join(",", externalLacpCableIds.OrderBy(x => x)) + "]");
+
+                if (crossFabricSkippedCableIds.Count > 0)
+                    LogToFile("CROSS FABRIC SKIPPED CABLE IDS | [" + string.Join(",", crossFabricSkippedCableIds.OrderBy(x => x)) + "]");
+
+                if (unknownRemotePassThroughCableIds.Count > 0)
+                    LogToFile("UNKNOWN REMOTE PASS-THROUGH CABLE IDS | [" + string.Join(",", unknownRemotePassThroughCableIds.OrderBy(x => x)) + "]");
 
                 int logIndex = 1;
                 foreach (List<RegisteredSwitchInfo> fabric in fabrics)
@@ -497,9 +539,15 @@ namespace AutoSwitch
         }
 
         private static Dictionary<string, BundleBuilder> BuildBundlesForFabricFromLiveRegistry(
+            string currentFabricId,
             HashSet<string> localIds,
+            Dictionary<string, string> deviceIdToFabricId,
             HashSet<int> globallyClaimedCableIds,
-            HashSet<int> externalLacpCableIds)
+            HashSet<int> externalLacpCableIds,
+            ref int crossFabricSkipCount,
+            HashSet<int> crossFabricSkippedCableIds,
+            ref int unknownRemotePassThroughCount,
+            HashSet<int> unknownRemotePassThroughCableIds)
         {
             Dictionary<string, BundleBuilder> result =
                 new Dictionary<string, BundleBuilder>(StringComparer.OrdinalIgnoreCase);
@@ -523,6 +571,29 @@ namespace AutoSwitch
                 if (string.IsNullOrWhiteSpace(localDeviceId) || string.IsNullOrWhiteSpace(remoteDeviceId))
                     continue;
 
+                bool remoteIsSwitch = LooksLikeSwitchIdentity(remoteDeviceId);
+                if (remoteIsSwitch)
+                {
+                    string remoteFabricId;
+                    if (deviceIdToFabricId.TryGetValue(remoteDeviceId, out remoteFabricId))
+                    {
+                        if (!string.Equals(remoteFabricId, currentFabricId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            crossFabricSkipCount++;
+                            crossFabricSkippedCableIds.Add(cable.CableId);
+                            LogCrossFabricSkip(cable.CableId, currentFabricId, localDeviceId, remoteDeviceId, remoteFabricId);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        unknownRemotePassThroughCount++;
+                        unknownRemotePassThroughCableIds.Add(cable.CableId);
+                        LogUnknownRemotePassThrough(cable.CableId, currentFabricId, localDeviceId, remoteDeviceId);
+                        continue;
+                    }
+                }
+
                 string key = localDeviceId + "||" + remoteDeviceId;
                 BundleBuilder builder;
                 if (!result.TryGetValue(key, out builder))
@@ -538,6 +609,55 @@ namespace AutoSwitch
             }
 
             return result;
+        }
+
+        private static void LogCrossFabricSkip(
+            int cableId,
+            string localFabricId,
+            string localDeviceId,
+            string remoteDeviceId,
+            string remoteFabricId)
+        {
+            string signature =
+                cableId.ToString(CultureInfo.InvariantCulture) + "|" +
+                localFabricId + "|" +
+                localDeviceId + "|" +
+                remoteDeviceId + "|" +
+                remoteFabricId;
+
+            if (!LoggedCrossFabricSignatures.Add(signature))
+                return;
+
+            LogToFile(
+                "CROSS FABRIC SKIP | cableId=" + cableId.ToString(CultureInfo.InvariantCulture) +
+                " | localFabric=" + localFabricId +
+                " | localDevice=" + localDeviceId +
+                " | remoteDevice=" + remoteDeviceId +
+                " | remoteFabric=" + remoteFabricId
+            );
+        }
+
+        private static void LogUnknownRemotePassThrough(
+            int cableId,
+            string localFabricId,
+            string localDeviceId,
+            string remoteDeviceId)
+        {
+            string signature =
+                cableId.ToString(CultureInfo.InvariantCulture) + "|" +
+                localFabricId + "|" +
+                localDeviceId + "|" +
+                remoteDeviceId;
+
+            if (!LoggedUnknownRemotePassThroughSignatures.Add(signature))
+                return;
+
+            LogToFile(
+                "UNKNOWN REMOTE PASS-THROUGH | cableId=" + cableId.ToString(CultureInfo.InvariantCulture) +
+                " | localFabric=" + localFabricId +
+                " | localDevice=" + localDeviceId +
+                " | remoteDevice=" + remoteDeviceId
+            );
         }
 
         private static bool TryResolveRemoteDeviceFromLiveCable(
