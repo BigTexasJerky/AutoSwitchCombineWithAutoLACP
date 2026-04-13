@@ -9,20 +9,18 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
-using Object = UnityEngine.Object;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.7.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.10.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
 {
     public sealed class AutoSwitchMod : MelonMod
     {
-        private const float ScanIntervalSeconds = 6.0f;
+        private const float ScanIntervalSeconds = 8.0f;
 
         private const float SameFabricXZTolerance = 0.40f;
         private const float AdjacentYTolerance = 0.040f;
@@ -34,15 +32,6 @@ namespace AutoSwitch
 
         private static readonly Regex TrailingRuntimeIdRegex =
             new Regex(@"_[\-]?\d+$", RegexOptions.Compiled);
-
-        private static readonly string[] ProbeKeywords =
-        {
-            "active", "selected", "preferred", "primary",
-            "route", "path", "traffic", "load", "usage",
-            "bandwidth", "speed", "throughput", "connected",
-            "source", "destination", "dest", "from", "to",
-            "endpoint", "port", "cable", "link"
-        };
 
         private static string DebugFolderPath =>
             Path.Combine(MelonEnvironment.ModsDirectory, "AutoSwitch");
@@ -67,11 +56,14 @@ namespace AutoSwitch
         private static readonly Dictionary<string, float> FabricIdToSpeed =
             new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly Dictionary<string, HashSet<int>> FabricIdToCandidateCableIds =
+        private static readonly Dictionary<string, HashSet<int>> FabricIdToBundleCableIds =
             new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly HashSet<int> WatchedCableIds =
             new HashSet<int>();
+
+        private static readonly HashSet<string> WatchedDevices =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly HashSet<string> LoggedPatches =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -79,18 +71,10 @@ namespace AutoSwitch
         private static readonly HashSet<string> LoggedBundles =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly HashSet<string> LoggedCableLinkSignatures =
+        private static readonly HashSet<string> LoggedProbeEvents =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        private static readonly HashSet<string> LoggedCableLinkTypes =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        private static readonly Dictionary<int, float> LastSetConnectionSpeed =
-            new Dictionary<int, float>();
 
         private static Type _networkMapType;
-        private static Type _cableLinkType;
-        private static Type _lacpGroupType;
 
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
@@ -100,11 +84,11 @@ namespace AutoSwitch
             ClassInjector.RegisterTypeInIl2Cpp<FabricGroupTag>();
 
             Directory.CreateDirectory(DebugFolderPath);
-            File.WriteAllText(DebugLogPath, "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] AutoSwitch 2.7 debug log started." + Environment.NewLine);
+            File.WriteAllText(DebugLogPath, "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] AutoSwitch 2.10 debug log started." + Environment.NewLine);
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.7.0 active. CableLink probe build.");
+            MelonLogger.Msg("[AutoSwitch] v2.10.0 active. Route/path probe build.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -118,12 +102,11 @@ namespace AutoSwitch
             RegisteredSwitches.Clear();
             RegisteredCables.Clear();
             FabricIdToSpeed.Clear();
-            FabricIdToCandidateCableIds.Clear();
+            FabricIdToBundleCableIds.Clear();
             WatchedCableIds.Clear();
+            WatchedDevices.Clear();
             LoggedBundles.Clear();
-            LoggedCableLinkSignatures.Clear();
-            LoggedCableLinkTypes.Clear();
-            LastSetConnectionSpeed.Clear();
+            LoggedProbeEvents.Clear();
 
             LogToFile("Scene loaded: " + sceneName + " (" + buildIndex.ToString(CultureInfo.InvariantCulture) + ")");
         }
@@ -136,7 +119,7 @@ namespace AutoSwitch
                     return;
 
                 _nextScanTime = Time.time + ScanIntervalSeconds;
-                RunProbePass();
+                RunRoutePathProbePass();
             }
             catch (Exception ex)
             {
@@ -146,7 +129,7 @@ namespace AutoSwitch
             }
         }
 
-        private void RunProbePass()
+        private void RunRoutePathProbePass()
         {
             RefreshRegisteredSwitchPositions();
 
@@ -171,7 +154,8 @@ namespace AutoSwitch
                 " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture) +
                 " | activeFabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) +
                 " | adjacentPairs=" + adjacencyPairs.ToString(CultureInfo.InvariantCulture) +
-                " | watchedCableIds=" + WatchedCableIds.Count.ToString(CultureInfo.InvariantCulture);
+                " | watchedCableIds=" + WatchedCableIds.Count.ToString(CultureInfo.InvariantCulture) +
+                " | watchedDevices=" + WatchedDevices.Count.ToString(CultureInfo.InvariantCulture);
 
             if (!string.Equals(summary, _lastSummary, StringComparison.Ordinal))
             {
@@ -184,7 +168,7 @@ namespace AutoSwitch
                 {
                     string fabricId = "FABRIC-" + fabricIndex.ToString("000", CultureInfo.InvariantCulture);
                     float speed = FabricIdToSpeed.ContainsKey(fabricId) ? FabricIdToSpeed[fabricId] : fabric.Sum(x => x.EstimatedCapacityGbps);
-                    int tracked = FabricIdToCandidateCableIds.ContainsKey(fabricId) ? FabricIdToCandidateCableIds[fabricId].Count : 0;
+                    int tracked = FabricIdToBundleCableIds.ContainsKey(fabricId) ? FabricIdToBundleCableIds[fabricId].Count : 0;
 
                     string members = string.Join(", ",
                         fabric.Select(x => x.DeviceName + "@(" +
@@ -196,20 +180,18 @@ namespace AutoSwitch
                     LogToFile("FABRIC | id=" + fabricId +
                               " | members=" + fabric.Count.ToString(CultureInfo.InvariantCulture) +
                               " | estCapacityGbps=" + speed.ToString("0.##", CultureInfo.InvariantCulture) +
-                              " | candidateCableIds=" + tracked.ToString(CultureInfo.InvariantCulture) +
+                              " | bundleCableIds=" + tracked.ToString(CultureInfo.InvariantCulture) +
                               " | switches=" + members);
 
                     if (tracked > 0)
                     {
-                        string cableList = string.Join(",", FabricIdToCandidateCableIds[fabricId].OrderBy(x => x));
-                        LogToFile("FABRIC CANDIDATE CABLE MAP | fabricId=" + fabricId + " | cableIds=[" + cableList + "]");
+                        string cableList = string.Join(",", FabricIdToBundleCableIds[fabricId].OrderBy(x => x));
+                        LogToFile("FABRIC BUNDLE CABLE MAP | fabricId=" + fabricId + " | cableIds=[" + cableList + "]");
                     }
 
                     fabricIndex++;
                 }
             }
-
-            ProbeCableLinks();
         }
 
         private void InstallNativePatches()
@@ -217,72 +199,76 @@ namespace AutoSwitch
             try
             {
                 _networkMapType = AccessTools.TypeByName("Il2Cpp.NetworkMap");
-                _cableLinkType = AccessTools.TypeByName("Il2Cpp.CableLink");
-                _lacpGroupType = AccessTools.TypeByName("Il2Cpp.NetworkMap+LACPGroup");
 
                 if (_networkMapType != null)
                 {
-                    MethodInfo registerSwitch = AccessTools.Method(_networkMapType, "RegisterSwitch");
-                    if (registerSwitch != null)
-                    {
-                        HarmonyInstance.Patch(
-                            registerSwitch,
-                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_RegisterSwitch_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
-                        );
-                        LogPatch("Patched NetworkMap.RegisterSwitch");
-                    }
+                    PatchIfFound(_networkMapType, "RegisterSwitch", nameof(NetworkMap_RegisterSwitch_Postfix), patchPostfix: true);
+                    PatchIfFound(_networkMapType, "RegisterCableConnection", nameof(NetworkMap_RegisterCableConnection_Postfix), patchPostfix: true);
 
-                    MethodInfo registerCable = AccessTools.Method(_networkMapType, "RegisterCableConnection");
-                    if (registerCable != null)
-                    {
-                        HarmonyInstance.Patch(
-                            registerCable,
-                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_RegisterCableConnection_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
-                        );
-                        LogPatch("Patched NetworkMap.RegisterCableConnection");
-                    }
+                    PatchIfFound(_networkMapType, "FindAllRoutes",
+                        nameof(NetworkMap_FindAllRoutes_Postfix),
+                        patchPostfix: true,
+                        patchPrefixName: nameof(NetworkMap_FindAllRoutes_Prefix));
 
-                    MethodInfo createLacp = AccessTools.Method(_networkMapType, "CreateLACPGroup");
-                    if (createLacp != null)
-                    {
-                        HarmonyInstance.Patch(
-                            createLacp,
-                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(NetworkMap_CreateLACPGroup_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
-                        );
-                        LogPatch("Patched NetworkMap.CreateLACPGroup");
-                    }
-                }
+                    PatchIfFound(_networkMapType, "FindPhysicalPath",
+                        nameof(NetworkMap_FindPhysicalPath_Postfix),
+                        patchPostfix: true,
+                        patchPrefixName: nameof(NetworkMap_FindPhysicalPath_Prefix));
 
-                if (_lacpGroupType != null)
-                {
-                    MethodInfo aggSpeed = AccessTools.Method(_lacpGroupType, "GetAggregatedSpeed");
-                    if (aggSpeed != null)
-                    {
-                        HarmonyInstance.Patch(
-                            aggSpeed,
-                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(LACPGroup_GetAggregatedSpeed_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
-                        );
-                        LogPatch("Patched NetworkMap+LACPGroup.GetAggregatedSpeed");
-                    }
-                }
+                    PatchIfFound(_networkMapType, "UpdateCustomerServerCountAndSpeed",
+                        nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Postfix),
+                        patchPostfix: true,
+                        patchPrefixName: nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix));
 
-                if (_cableLinkType != null)
-                {
-                    MethodInfo setConnectionSpeed = AccessTools.Method(_cableLinkType, "SetConnectionSpeed", new Type[] { typeof(float) });
-                    if (setConnectionSpeed != null)
-                    {
-                        HarmonyInstance.Patch(
-                            setConnectionSpeed,
-                            prefix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_SetConnectionSpeed_Prefix), BindingFlags.NonPublic | BindingFlags.Static)),
-                            postfix: new HarmonyMethod(typeof(AutoSwitchMod).GetMethod(nameof(CableLink_SetConnectionSpeed_Postfix), BindingFlags.NonPublic | BindingFlags.Static))
-                        );
-                        LogPatch("Patched CableLink.SetConnectionSpeed");
-                    }
+                    PatchIfFound(_networkMapType, "GetLACPGroupForCable",
+                        nameof(NetworkMap_GetLACPGroupForCable_Postfix),
+                        patchPostfix: true);
+
+                    PatchIfFound(_networkMapType, "GetLACPGroupBetween",
+                        nameof(NetworkMap_GetLACPGroupBetween_Postfix),
+                        patchPostfix: true);
                 }
             }
             catch (Exception ex)
             {
                 LogToFile("InstallNativePatches failed: " + ex);
+            }
+        }
+
+        private void PatchIfFound(Type type, string methodName, string postfixName = null, bool patchPostfix = false, string patchPrefixName = null)
+        {
+            try
+            {
+                MethodInfo target = AccessTools.Method(type, methodName);
+                if (target == null)
+                {
+                    LogToFile("PATCH MISS | " + type.FullName + "." + methodName);
+                    return;
+                }
+
+                HarmonyMethod prefix = null;
+                HarmonyMethod postfix = null;
+
+                if (!string.IsNullOrWhiteSpace(patchPrefixName))
+                {
+                    MethodInfo prefixMethod = typeof(AutoSwitchMod).GetMethod(patchPrefixName, BindingFlags.NonPublic | BindingFlags.Static);
+                    if (prefixMethod != null)
+                        prefix = new HarmonyMethod(prefixMethod);
+                }
+
+                if (patchPostfix && !string.IsNullOrWhiteSpace(postfixName))
+                {
+                    MethodInfo postfixMethod = typeof(AutoSwitchMod).GetMethod(postfixName, BindingFlags.NonPublic | BindingFlags.Static);
+                    if (postfixMethod != null)
+                        postfix = new HarmonyMethod(postfixMethod);
+                }
+
+                HarmonyInstance.Patch(target, prefix: prefix, postfix: postfix);
+                LogPatch("Patched " + type.FullName + "." + methodName);
+            }
+            catch (Exception ex)
+            {
+                LogToFile("PATCH FAIL | " + type.FullName + "." + methodName + " | " + ex);
             }
         }
 
@@ -364,92 +350,120 @@ namespace AutoSwitch
             }
         }
 
-        private static void NetworkMap_CreateLACPGroup_Postfix(string __0, string __1, object __2, ref int __result)
+        private static void NetworkMap_FindAllRoutes_Prefix(string __0, string __1)
         {
             try
             {
-                List<int> cableIds = ExtractIntList(__2);
-                string joined = string.Join(",", cableIds.OrderBy(x => x));
+                if (!IsInterestingRouteRequest(__0, __1))
+                    return;
 
-                LogToFile("CREATE LACP | groupId=" + __result.ToString(CultureInfo.InvariantCulture) +
-                          " | deviceA=" + __0 +
+                LogOnce("FindAllRoutesPRE|" + __0 + "|" + __1,
+                    "ROUTE PATH | FindAllRoutes PRE | base=" + __0 + " | server=" + __1);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_FindAllRoutes_Postfix(string __0, string __1, object __result)
+        {
+            try
+            {
+                if (!IsInterestingRouteRequest(__0, __1))
+                    return;
+
+                LogToFile("ROUTE PATH | FindAllRoutes POST | base=" + __0 +
+                          " | server=" + __1 +
+                          " | routes=" + FormatNestedRoutes(__result));
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_FindPhysicalPath_Prefix(string __0, string __1)
+        {
+            try
+            {
+                if (!IsInterestingRouteRequest(__0, __1))
+                    return;
+
+                LogOnce("FindPhysicalPathPRE|" + __0 + "|" + __1,
+                    "ROUTE PATH | FindPhysicalPath PRE | start=" + __0 + " | target=" + __1);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_FindPhysicalPath_Postfix(string __0, string __1, object __result)
+        {
+            try
+            {
+                if (!IsInterestingRouteRequest(__0, __1))
+                    return;
+
+                LogToFile("ROUTE PATH | FindPhysicalPath POST | start=" + __0 +
+                          " | target=" + __1 +
+                          " | path=" + FormatStringList(__result));
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix(int __0, int __1, float __2)
+        {
+            try
+            {
+                LogOnce("UpdateCustomerPRE|" + __0.ToString(CultureInfo.InvariantCulture) + "|" + __1.ToString(CultureInfo.InvariantCulture) + "|" + __2.ToString("0.##", CultureInfo.InvariantCulture),
+                    "THROUGHPUT | UpdateCustomerServerCountAndSpeed PRE | customerId=" + __0.ToString(CultureInfo.InvariantCulture) +
+                    " | serverCount=" + __1.ToString(CultureInfo.InvariantCulture) +
+                    " | speed=" + __2.ToString("0.##", CultureInfo.InvariantCulture));
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_UpdateCustomerServerCountAndSpeed_Postfix(int __0, int __1, float __2)
+        {
+            try
+            {
+                LogToFile("THROUGHPUT | UpdateCustomerServerCountAndSpeed POST | customerId=" + __0.ToString(CultureInfo.InvariantCulture) +
+                          " | serverCount=" + __1.ToString(CultureInfo.InvariantCulture) +
+                          " | speed=" + __2.ToString("0.##", CultureInfo.InvariantCulture));
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_GetLACPGroupForCable_Postfix(int __0, object __result)
+        {
+            try
+            {
+                if (!WatchedCableIds.Contains(__0))
+                    return;
+
+                LogToFile("LACP QUERY | GetLACPGroupForCable | cableId=" + __0.ToString(CultureInfo.InvariantCulture) +
+                          " | result=" + FormatLacpGroup(__result));
+            }
+            catch
+            {
+            }
+        }
+
+        private static void NetworkMap_GetLACPGroupBetween_Postfix(string __0, string __1, object __result)
+        {
+            try
+            {
+                if (!StringLooksWatchedDevice(__0) && !StringLooksWatchedDevice(__1))
+                    return;
+
+                LogToFile("LACP QUERY | GetLACPGroupBetween | deviceA=" + __0 +
                           " | deviceB=" + __1 +
-                          " | cableIds=[" + joined + "]");
-            }
-            catch (Exception ex)
-            {
-                LogToFile("NetworkMap_CreateLACPGroup_Postfix failed: " + ex);
-            }
-        }
-
-        private static void LACPGroup_GetAggregatedSpeed_Postfix(object __instance, ref float __result)
-        {
-            try
-            {
-                if (__instance == null)
-                    return;
-
-                object raw = TryGetMemberValue(__instance, "cableIds");
-                List<int> cableIds = ExtractIntList(raw);
-
-                if (cableIds.Any(x => WatchedCableIds.Contains(x)))
-                {
-                    string ids = string.Join(",", cableIds.OrderBy(x => x));
-                    LogToFile("LACP AGG SPEED | cableIds=[" + ids + "] | result=" + __result.ToString("0.##", CultureInfo.InvariantCulture));
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static void CableLink_SetConnectionSpeed_Prefix(object __instance, ref float __0)
-        {
-            try
-            {
-                if (__instance == null)
-                    return;
-
-                List<int> cableIds = ExtractIntList(TryGetMemberValue(__instance, "cableIDsOnLink"));
-                if (cableIds.Count == 0)
-                    return;
-
-                if (!cableIds.Any(x => WatchedCableIds.Contains(x)))
-                    return;
-
-                int key = GetStableObjectKey(__instance);
-                LastSetConnectionSpeed[key] = __0;
-
-                LogToFile("CABLELINK SET SPEED PRE | key=" + key.ToString(CultureInfo.InvariantCulture) +
-                          " | requested=" + __0.ToString("0.##", CultureInfo.InvariantCulture) +
-                          " | cableIds=[" + string.Join(",", cableIds.OrderBy(x => x)) + "]");
-            }
-            catch
-            {
-            }
-        }
-
-        private static void CableLink_SetConnectionSpeed_Postfix(object __instance, float __0)
-        {
-            try
-            {
-                if (__instance == null)
-                    return;
-
-                List<int> cableIds = ExtractIntList(TryGetMemberValue(__instance, "cableIDsOnLink"));
-                if (cableIds.Count == 0)
-                    return;
-
-                if (!cableIds.Any(x => WatchedCableIds.Contains(x)))
-                    return;
-
-                int key = GetStableObjectKey(__instance);
-                float previous = LastSetConnectionSpeed.ContainsKey(key) ? LastSetConnectionSpeed[key] : __0;
-
-                LogToFile("CABLELINK SET SPEED POST | key=" + key.ToString(CultureInfo.InvariantCulture) +
-                          " | requested=" + __0.ToString("0.##", CultureInfo.InvariantCulture) +
-                          " | previousSeen=" + previous.ToString("0.##", CultureInfo.InvariantCulture) +
-                          " | cableIds=[" + string.Join(",", cableIds.OrderBy(x => x)) + "]");
+                          " | result=" + FormatLacpGroup(__result));
             }
             catch
             {
@@ -459,8 +473,9 @@ namespace AutoSwitch
         private void DetectRemoteDeviceBundles(List<List<RegisteredSwitchInfo>> fabrics)
         {
             FabricIdToSpeed.Clear();
-            FabricIdToCandidateCableIds.Clear();
+            FabricIdToBundleCableIds.Clear();
             WatchedCableIds.Clear();
+            WatchedDevices.Clear();
 
             int index = 1;
 
@@ -469,7 +484,7 @@ namespace AutoSwitch
                 string fabricId = "FABRIC-" + index.ToString("000", CultureInfo.InvariantCulture);
                 float fabricSpeed = fabric.Sum(x => x.EstimatedCapacityGbps);
                 FabricIdToSpeed[fabricId] = fabricSpeed;
-                FabricIdToCandidateCableIds[fabricId] = new HashSet<int>();
+                FabricIdToBundleCableIds[fabricId] = new HashSet<int>();
 
                 HashSet<string> fabricDevices = new HashSet<string>(
                     fabric.Select(x => x.DeviceName).Where(x => !string.IsNullOrWhiteSpace(x)),
@@ -485,7 +500,9 @@ namespace AutoSwitch
 
                     if (aIn && bIn)
                     {
-                        FabricIdToCandidateCableIds[fabricId].Add(cable.CableId);
+                        FabricIdToBundleCableIds[fabricId].Add(cable.CableId);
+                        if (!string.IsNullOrWhiteSpace(cable.DeviceA)) WatchedDevices.Add(cable.DeviceA);
+                        if (!string.IsNullOrWhiteSpace(cable.DeviceB)) WatchedDevices.Add(cable.DeviceB);
                         continue;
                     }
 
@@ -517,8 +534,11 @@ namespace AutoSwitch
 
                     foreach (RegisteredCableInfo cable in bundle)
                     {
-                        FabricIdToCandidateCableIds[fabricId].Add(cable.CableId);
+                        FabricIdToBundleCableIds[fabricId].Add(cable.CableId);
                         WatchedCableIds.Add(cable.CableId);
+
+                        if (!string.IsNullOrWhiteSpace(cable.DeviceA)) WatchedDevices.Add(cable.DeviceA);
+                        if (!string.IsNullOrWhiteSpace(cable.DeviceB)) WatchedDevices.Add(cable.DeviceB);
                     }
 
                     string cableList = string.Join(",", bundle.Select(x => x.CableId).OrderBy(x => x));
@@ -537,196 +557,74 @@ namespace AutoSwitch
             }
         }
 
-        private void ProbeCableLinks()
+        private static bool IsInterestingRouteRequest(string a, string b)
         {
+            if (StringLooksWatchedDevice(a) || StringLooksWatchedDevice(b))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(a) && a.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(b) && b.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
+        }
+
+        private static bool StringLooksWatchedDevice(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            if (WatchedDevices.Contains(value))
+                return true;
+
+            foreach (RegisteredCableInfo cable in RegisteredCables.Values)
+            {
+                if (!WatchedCableIds.Contains(cable.CableId))
+                    continue;
+
+                if (string.Equals(cable.DeviceA, value, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cable.DeviceB, value, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void LogOnce(string key, string message)
+        {
+            if (LoggedProbeEvents.Add(key))
+                LogToFile(message);
+        }
+
+        private static string FormatNestedRoutes(object raw)
+        {
+            if (raw == null)
+                return "<null>";
+
             try
             {
-                if (_cableLinkType == null)
-                    return;
+                IEnumerable outer = raw as IEnumerable;
+                if (outer == null || raw is string)
+                    return raw.ToString();
 
-                MethodInfo findAllMethod = typeof(Resources).GetMethod("FindObjectsOfTypeAll", new Type[] { typeof(Type) });
-                if (findAllMethod == null)
+                List<string> groups = new List<string>();
+                int outerCount = 0;
+
+                foreach (object inner in outer)
                 {
-                    LogToFile("PROBE | Resources.FindObjectsOfTypeAll(Type) not found.");
-                    return;
-                }
-
-                Object[] found = findAllMethod.Invoke(null, new object[] { _cableLinkType }) as Object[];
-                if (found == null)
-                {
-                    LogToFile("PROBE | No CableLink array returned.");
-                    return;
-                }
-
-                LogCableLinkTypeMetadata(_cableLinkType);
-
-                int watchedMatches = 0;
-
-                foreach (Object obj in found)
-                {
-                    object cableLinkObj = obj;
-                    if (cableLinkObj == null)
-                        continue;
-
-                    List<int> cableIds = ExtractIntList(TryGetMemberValue(cableLinkObj, "cableIDsOnLink"));
-                    if (cableIds.Count == 0)
-                        cableIds = ExtractIntList(TryGetMemberValue(cableLinkObj, "cableIds"));
-
-                    if (cableIds.Count == 0)
-                        continue;
-
-                    if (!cableIds.Any(x => WatchedCableIds.Contains(x)))
-                        continue;
-
-                    watchedMatches++;
-
-                    string signature = BuildCableLinkSignature(cableLinkObj, cableIds);
-                    if (LoggedCableLinkSignatures.Add(signature))
+                    if (outerCount >= 8)
                     {
-                        LogToFile(BuildCableLinkDump(cableLinkObj, cableIds));
+                        groups.Add("...");
+                        break;
                     }
+
+                    groups.Add("[" + FormatStringList(inner) + "]");
+                    outerCount++;
                 }
 
-                LogToFile("PROBE | CableLink watched matches=" + watchedMatches.ToString(CultureInfo.InvariantCulture) +
-                          " | watchedCableIds=[" + string.Join(",", WatchedCableIds.OrderBy(x => x)) + "]");
-            }
-            catch (Exception ex)
-            {
-                LogToFile("ProbeCableLinks failed: " + ex);
-            }
-        }
-
-        private static void LogCableLinkTypeMetadata(Type cableLinkType)
-        {
-            try
-            {
-                string typeName = cableLinkType.FullName;
-                if (!LoggedCableLinkTypes.Add(typeName))
-                    return;
-
-                StringBuilder sb = new StringBuilder();
-                sb.Append("CABLELINK TYPE META | type=").Append(typeName);
-
-                List<string> methodNames = SafeMethods(cableLinkType)
-                    .Select(m => m.Name)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Where(n => NameMatchesProbeKeyword(n))
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                List<string> fieldNames = SafeFields(cableLinkType)
-                    .Select(f => f.Name)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Where(n => NameMatchesProbeKeyword(n))
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                List<string> propNames = SafeProperties(cableLinkType)
-                    .Select(p => p.Name)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Where(n => NameMatchesProbeKeyword(n))
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                sb.Append(" | methods=[").Append(string.Join(",", methodNames)).Append("]");
-                sb.Append(" | fields=[").Append(string.Join(",", fieldNames)).Append("]");
-                sb.Append(" | props=[").Append(string.Join(",", propNames)).Append("]");
-
-                LogToFile(sb.ToString());
-            }
-            catch (Exception ex)
-            {
-                LogToFile("LogCableLinkTypeMetadata failed: " + ex);
-            }
-        }
-
-        private static string BuildCableLinkSignature(object cableLinkObj, List<int> cableIds)
-        {
-            int key = GetStableObjectKey(cableLinkObj);
-            string ids = string.Join(",", cableIds.OrderBy(x => x));
-
-            string selected = ReadSimpleProbeValue(cableLinkObj, "selected");
-            string active = ReadSimpleProbeValue(cableLinkObj, "active");
-            string speed = ReadSimpleProbeValue(cableLinkObj, "connectionSpeed");
-
-            return "CableLink#" + key.ToString(CultureInfo.InvariantCulture) +
-                   "|ids=" + ids +
-                   "|selected=" + selected +
-                   "|active=" + active +
-                   "|speed=" + speed;
-        }
-
-        private static string BuildCableLinkDump(object cableLinkObj, List<int> cableIds)
-        {
-            StringBuilder sb = new StringBuilder();
-
-            int key = GetStableObjectKey(cableLinkObj);
-            GameObject go = DiscoverGameObject(cableLinkObj);
-
-            sb.Append("CABLELINK PROBE | key=").Append(key.ToString(CultureInfo.InvariantCulture));
-            sb.Append(" | type=").Append(cableLinkObj.GetType().FullName);
-            sb.Append(" | cableIds=[").Append(string.Join(",", cableIds.OrderBy(x => x))).Append("]");
-
-            if (go != null)
-            {
-                sb.Append(" | gameObject=").Append(go.name);
-                sb.Append(" | instanceId=").Append(go.GetInstanceID().ToString(CultureInfo.InvariantCulture));
-            }
-
-            List<string> memberPairs = new List<string>();
-
-            foreach (FieldInfo field in SafeFields(cableLinkObj.GetType()))
-            {
-                if (!NameMatchesProbeKeyword(field.Name))
-                    continue;
-
-                string value = FormatProbeValue(SafeGetFieldValue(field, cableLinkObj));
-                memberPairs.Add("F:" + field.Name + "=" + value);
-            }
-
-            foreach (PropertyInfo prop in SafeProperties(cableLinkObj.GetType()))
-            {
-                if (!prop.CanRead)
-                    continue;
-
-                if (!NameMatchesProbeKeyword(prop.Name))
-                    continue;
-
-                string value = FormatProbeValue(SafeGetPropertyValue(prop, cableLinkObj));
-                memberPairs.Add("P:" + prop.Name + "=" + value);
-            }
-
-            sb.Append(" | probeMembers={").Append(string.Join(" ; ", memberPairs.Distinct(StringComparer.OrdinalIgnoreCase))).Append("}");
-
-            object endpointsA = TryGetMemberValue(cableLinkObj, "from");
-            object endpointsB = TryGetMemberValue(cableLinkObj, "to");
-            object source = TryGetMemberValue(cableLinkObj, "source");
-            object destination = TryGetMemberValue(cableLinkObj, "destination");
-            object endpoint1 = TryGetMemberValue(cableLinkObj, "endpointA");
-            object endpoint2 = TryGetMemberValue(cableLinkObj, "endpointB");
-            object currentPath = TryGetMemberValue(cableLinkObj, "path");
-            object routeObj = TryGetMemberValue(cableLinkObj, "route");
-
-            sb.Append(" | refs={");
-            sb.Append("from=").Append(FormatProbeValue(endpointsA)).Append(" ; ");
-            sb.Append("to=").Append(FormatProbeValue(endpointsB)).Append(" ; ");
-            sb.Append("source=").Append(FormatProbeValue(source)).Append(" ; ");
-            sb.Append("destination=").Append(FormatProbeValue(destination)).Append(" ; ");
-            sb.Append("endpointA=").Append(FormatProbeValue(endpoint1)).Append(" ; ");
-            sb.Append("endpointB=").Append(FormatProbeValue(endpoint2)).Append(" ; ");
-            sb.Append("path=").Append(FormatProbeValue(currentPath)).Append(" ; ");
-            sb.Append("route=").Append(FormatProbeValue(routeObj));
-            sb.Append("}");
-
-            return sb.ToString();
-        }
-
-        private static string ReadSimpleProbeValue(object target, string memberName)
-        {
-            try
-            {
-                object value = TryGetMemberValue(target, memberName);
-                return FormatProbeValue(value);
+                return string.Join(" | ", groups);
             }
             catch
             {
@@ -734,19 +632,66 @@ namespace AutoSwitch
             }
         }
 
-        private static bool NameMatchesProbeKeyword(string name)
+        private static string FormatStringList(object raw)
         {
-            if (string.IsNullOrWhiteSpace(name))
-                return false;
+            if (raw == null)
+                return "<null>";
 
-            string lower = name.ToLowerInvariant();
-            foreach (string keyword in ProbeKeywords)
+            try
             {
-                if (lower.Contains(keyword))
-                    return true;
-            }
+                IEnumerable enumerable = raw as IEnumerable;
+                if (enumerable == null || raw is string)
+                    return raw.ToString();
 
-            return false;
+                List<string> items = new List<string>();
+                int count = 0;
+
+                foreach (object item in enumerable)
+                {
+                    if (count >= 20)
+                    {
+                        items.Add("...");
+                        break;
+                    }
+
+                    items.Add(item == null ? "<null>" : item.ToString());
+                    count++;
+                }
+
+                return string.Join(" -> ", items);
+            }
+            catch
+            {
+                return "<err>";
+            }
+        }
+
+        private static string FormatLacpGroup(object groupObj)
+        {
+            if (groupObj == null)
+                return "<null>";
+
+            try
+            {
+                object groupId = TryGetMemberValue(groupObj, "groupId");
+                object deviceA = TryGetMemberValue(groupObj, "deviceA");
+                object deviceB = TryGetMemberValue(groupObj, "deviceB");
+                List<int> cableIds = ExtractIntList(TryGetMemberValue(groupObj, "cableIds"));
+
+                return "groupId=" + SafeString(groupId) +
+                       ",deviceA=" + SafeString(deviceA) +
+                       ",deviceB=" + SafeString(deviceB) +
+                       ",cableIds=[" + string.Join(",", cableIds.OrderBy(x => x)) + "]";
+            }
+            catch
+            {
+                return groupObj.GetType().Name;
+            }
+        }
+
+        private static string SafeString(object value)
+        {
+            return value == null ? "<null>" : Convert.ToString(value, CultureInfo.InvariantCulture);
         }
 
         private static string BuildExactRemoteDeviceKey(RegisteredCableInfo cable, bool sideAIsLocal)
@@ -1007,38 +952,6 @@ namespace AutoSwitch
             return string.Empty;
         }
 
-        private static int GetStableObjectKey(object obj)
-        {
-            if (obj == null)
-                return 0;
-
-            try
-            {
-                GameObject go = DiscoverGameObject(obj);
-                if (go != null)
-                    return go.GetInstanceID();
-            }
-            catch
-            {
-            }
-
-            try
-            {
-                PropertyInfo prop = obj.GetType().GetProperty("Pointer", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (prop != null)
-                {
-                    object value = prop.GetValue(obj, null);
-                    if (value != null)
-                        return value.GetHashCode();
-                }
-            }
-            catch
-            {
-            }
-
-            return obj.GetHashCode();
-        }
-
         private static GameObject DiscoverGameObject(object obj)
         {
             if (obj == null)
@@ -1178,22 +1091,28 @@ namespace AutoSwitch
             catch { return new PropertyInfo[0]; }
         }
 
-        private static IEnumerable<MethodInfo> SafeMethods(Type t)
+        private static object TryGetMemberValue(object target, string memberName)
         {
-            try { return t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); }
-            catch { return new MethodInfo[0]; }
-        }
+            if (target == null || string.IsNullOrWhiteSpace(memberName))
+                return null;
 
-        private static object SafeGetFieldValue(FieldInfo field, object target)
-        {
-            try { return field.GetValue(target); }
-            catch { return "<err>"; }
-        }
+            try
+            {
+                Type t = target.GetType();
 
-        private static object SafeGetPropertyValue(PropertyInfo prop, object target)
-        {
-            try { return prop.GetValue(target, null); }
-            catch { return "<err>"; }
+                PropertyInfo prop = t.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (prop != null && prop.CanRead)
+                    return prop.GetValue(target, null);
+
+                FieldInfo field = t.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (field != null)
+                    return field.GetValue(target);
+            }
+            catch
+            {
+            }
+
+            return null;
         }
 
         private static List<int> ExtractIntList(object raw)
@@ -1236,81 +1155,6 @@ namespace AutoSwitch
             }
 
             return result.Distinct().ToList();
-        }
-
-        private static object TryGetMemberValue(object target, string memberName)
-        {
-            if (target == null || string.IsNullOrWhiteSpace(memberName))
-                return null;
-
-            try
-            {
-                Type t = target.GetType();
-
-                PropertyInfo prop = t.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (prop != null && prop.CanRead)
-                    return prop.GetValue(target, null);
-
-                FieldInfo field = t.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (field != null)
-                    return field.GetValue(target);
-            }
-            catch
-            {
-            }
-
-            return null;
-        }
-
-        private static string FormatProbeValue(object value)
-        {
-            if (value == null)
-                return "<null>";
-
-            if (value is string)
-                return "\"" + value.ToString() + "\"";
-
-            if (value is bool || value is byte || value is sbyte ||
-                value is short || value is ushort || value is int || value is uint ||
-                value is long || value is ulong || value is float || value is double || value is decimal)
-                return Convert.ToString(value, CultureInfo.InvariantCulture);
-
-            if (value is Enum)
-                return value.ToString();
-
-            if (value is Vector3)
-            {
-                Vector3 v = (Vector3)value;
-                return "(" + v.x.ToString("0.###", CultureInfo.InvariantCulture) + "," +
-                             v.y.ToString("0.###", CultureInfo.InvariantCulture) + "," +
-                             v.z.ToString("0.###", CultureInfo.InvariantCulture) + ")";
-            }
-
-            GameObject go = DiscoverGameObject(value);
-            if (go != null)
-                return value.GetType().Name + ":" + go.name + "#" + go.GetInstanceID().ToString(CultureInfo.InvariantCulture);
-
-            IEnumerable ints = value as IEnumerable;
-            if (ints != null && !(value is string))
-            {
-                List<string> items = new List<string>();
-                int count = 0;
-                foreach (object item in ints)
-                {
-                    if (count >= 12)
-                    {
-                        items.Add("...");
-                        break;
-                    }
-
-                    items.Add(item == null ? "<null>" : item.ToString());
-                    count++;
-                }
-
-                return "[" + string.Join(",", items) + "]";
-            }
-
-            return value.GetType().Name + ":" + value;
         }
 
         private static string NormalizeCloneName(string name)
