@@ -1,4 +1,5 @@
 ﻿using HarmonyLib;
+using Il2Cpp;
 using Il2CppInterop.Runtime.Injection;
 using MelonLoader;
 using MelonLoader.Utils;
@@ -13,14 +14,14 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.10.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.11.1", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
 {
     public sealed class AutoSwitchMod : MelonMod
     {
-        private const float ScanIntervalSeconds = 8.0f;
+        private const float ScanIntervalSeconds = 6.0f;
 
         private const float SameFabricXZTolerance = 0.40f;
         private const float AdjacentYTolerance = 0.040f;
@@ -47,34 +48,23 @@ namespace AutoSwitch
             "Switch16CU"
         };
 
-        private static readonly Dictionary<string, RegisteredSwitchInfo> RegisteredSwitches =
+        internal static readonly Dictionary<string, RegisteredSwitchInfo> RegisteredSwitches =
             new Dictionary<string, RegisteredSwitchInfo>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly Dictionary<int, RegisteredCableInfo> RegisteredCables =
+        internal static readonly Dictionary<int, RegisteredCableInfo> RegisteredCables =
             new Dictionary<int, RegisteredCableInfo>();
 
         private static readonly Dictionary<string, float> FabricIdToSpeed =
             new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly Dictionary<string, HashSet<int>> FabricIdToBundleCableIds =
-            new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
-
-        private static readonly HashSet<int> WatchedCableIds =
-            new HashSet<int>();
-
-        private static readonly HashSet<string> WatchedDevices =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, List<int>> FabricIdToBundleCableIds =
+            new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly HashSet<string> LoggedPatches =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly HashSet<string> LoggedBundles =
+        private static readonly HashSet<string> LoggedBundleSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        private static readonly HashSet<string> LoggedProbeEvents =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        private static Type _networkMapType;
 
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
@@ -84,11 +74,12 @@ namespace AutoSwitch
             ClassInjector.RegisterTypeInIl2Cpp<FabricGroupTag>();
 
             Directory.CreateDirectory(DebugFolderPath);
-            File.WriteAllText(DebugLogPath, "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] AutoSwitch 2.10 debug log started." + Environment.NewLine);
+            File.WriteAllText(DebugLogPath, "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] AutoSwitch 2.11.1 debug log started." + Environment.NewLine);
 
             InstallNativePatches();
+            SaveDataAutoLACP.StartSafeBootstrap();
 
-            MelonLogger.Msg("[AutoSwitch] v2.10.0 active. Route/path probe build.");
+            MelonLogger.Msg("[AutoSwitch] v2.11.1 active. Save-data endpoint bundle mode.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -103,10 +94,10 @@ namespace AutoSwitch
             RegisteredCables.Clear();
             FabricIdToSpeed.Clear();
             FabricIdToBundleCableIds.Clear();
-            WatchedCableIds.Clear();
-            WatchedDevices.Clear();
-            LoggedBundles.Clear();
-            LoggedProbeEvents.Clear();
+            LoggedBundleSignatures.Clear();
+
+            SaveDataAutoLACP.ResetForScene();
+            SaveDataAutoLACP.StartSafeBootstrap();
 
             LogToFile("Scene loaded: " + sceneName + " (" + buildIndex.ToString(CultureInfo.InvariantCulture) + ")");
         }
@@ -119,7 +110,7 @@ namespace AutoSwitch
                     return;
 
                 _nextScanTime = Time.time + ScanIntervalSeconds;
-                RunRoutePathProbePass();
+                RunSaveDataBundlePass();
             }
             catch (Exception ex)
             {
@@ -129,7 +120,7 @@ namespace AutoSwitch
             }
         }
 
-        private void RunRoutePathProbePass()
+        private void RunSaveDataBundlePass()
         {
             RefreshRegisteredSwitchPositions();
 
@@ -144,18 +135,81 @@ namespace AutoSwitch
                 .ThenByDescending(f => f.Sum(x => x.EstimatedCapacityGbps))
                 .ToList();
 
-            DetectRemoteDeviceBundles(fabrics);
+            NetworkSaveData networkSaveData = GetNetworkSaveData();
+            List<CableSaveInfo> allSaveCables = ReadAllSaveCables(networkSaveData);
+
+            FabricIdToSpeed.Clear();
+            FabricIdToBundleCableIds.Clear();
+
+            List<BundleBuilder> allBundles = new List<BundleBuilder>();
+            HashSet<string> allManagedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            int fabricIndex = 1;
+
+            foreach (List<RegisteredSwitchInfo> fabric in fabrics)
+            {
+                string fabricId = "FABRIC-" + fabricIndex.ToString("000", CultureInfo.InvariantCulture);
+                float fabricSpeed = fabric.Sum(x => x.EstimatedCapacityGbps);
+                FabricIdToSpeed[fabricId] = fabricSpeed;
+
+                HashSet<string> localIds = new HashSet<string>(
+                    fabric.Select(x => x.DeviceName).Where(x => !string.IsNullOrWhiteSpace(x)),
+                    StringComparer.OrdinalIgnoreCase
+                );
+
+                foreach (string localId in localIds)
+                    allManagedIds.Add(localId);
+
+                Dictionary<string, BundleBuilder> bundlesForFabric = BuildBundlesForFabric(localIds, allSaveCables);
+                List<int> fabricCableIds = new List<int>();
+
+                foreach (BundleBuilder bundle in bundlesForFabric.Values.OrderBy(b => b.LocalDeviceId).ThenBy(b => b.RemoteDeviceId))
+                {
+                    bundle.FabricId = fabricId;
+                    bundle.FabricEstimatedSpeedGbps = fabricSpeed;
+
+                    List<int> distinctIds = bundle.CableIds.Distinct().OrderBy(x => x).ToList();
+                    if (distinctIds.Count >= 2)
+                    {
+                        foreach (int cableId in distinctIds)
+                            fabricCableIds.Add(cableId);
+
+                        allBundles.Add(bundle);
+
+                        string signature =
+                            fabricId + "|" +
+                            bundle.LocalDeviceId + "|" +
+                            bundle.RemoteDeviceId + "|" +
+                            string.Join(",", distinctIds);
+
+                        if (LoggedBundleSignatures.Add(signature))
+                        {
+                            LogToFile("SAVE BUNDLE | fabricId=" + fabricId +
+                                      " | local=" + bundle.LocalDeviceId +
+                                      " | remote=" + bundle.RemoteDeviceId +
+                                      " | cableCount=" + distinctIds.Count.ToString(CultureInfo.InvariantCulture) +
+                                      " | estPerCableGbps=" + (fabricSpeed / distinctIds.Count).ToString("0.##", CultureInfo.InvariantCulture) +
+                                      " | cableIds=[" + string.Join(",", distinctIds) + "]");
+                        }
+                    }
+                }
+
+                FabricIdToBundleCableIds[fabricId] = fabricCableIds;
+                fabricIndex++;
+            }
+
+            SaveDataAutoLACP.UpdateDesiredState(allBundles, allManagedIds);
 
             int adjacencyPairs = fabrics.Sum(f => Math.Max(0, f.Count - 1));
-
             string summary =
                 "SCAN SUMMARY | registeredSwitches=" + RegisteredSwitches.Count.ToString(CultureInfo.InvariantCulture) +
                 " | registeredCables=" + RegisteredCables.Count.ToString(CultureInfo.InvariantCulture) +
+                " | saveCables=" + allSaveCables.Count.ToString(CultureInfo.InvariantCulture) +
                 " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture) +
                 " | activeFabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) +
                 " | adjacentPairs=" + adjacencyPairs.ToString(CultureInfo.InvariantCulture) +
-                " | watchedCableIds=" + WatchedCableIds.Count.ToString(CultureInfo.InvariantCulture) +
-                " | watchedDevices=" + WatchedDevices.Count.ToString(CultureInfo.InvariantCulture);
+                " | bundleCount=" + allBundles.Count.ToString(CultureInfo.InvariantCulture) +
+                " | managedIds=" + allManagedIds.Count.ToString(CultureInfo.InvariantCulture);
 
             if (!string.Equals(summary, _lastSummary, StringComparison.Ordinal))
             {
@@ -163,12 +217,18 @@ namespace AutoSwitch
                 MelonLogger.Msg("[AutoSwitch] " + summary);
                 LogToFile(summary);
 
-                int fabricIndex = 1;
+                int logIndex = 1;
                 foreach (List<RegisteredSwitchInfo> fabric in fabrics)
                 {
-                    string fabricId = "FABRIC-" + fabricIndex.ToString("000", CultureInfo.InvariantCulture);
-                    float speed = FabricIdToSpeed.ContainsKey(fabricId) ? FabricIdToSpeed[fabricId] : fabric.Sum(x => x.EstimatedCapacityGbps);
-                    int tracked = FabricIdToBundleCableIds.ContainsKey(fabricId) ? FabricIdToBundleCableIds[fabricId].Count : 0;
+                    string fabricId = "FABRIC-" + logIndex.ToString("000", CultureInfo.InvariantCulture);
+                    float speed = FabricIdToSpeed.ContainsKey(fabricId)
+                        ? FabricIdToSpeed[fabricId]
+                        : fabric.Sum(x => x.EstimatedCapacityGbps);
+
+                    List<int> cableIds;
+                    int tracked = FabricIdToBundleCableIds.TryGetValue(fabricId, out cableIds)
+                        ? cableIds.Distinct().Count()
+                        : 0;
 
                     string members = string.Join(", ",
                         fabric.Select(x => x.DeviceName + "@(" +
@@ -180,16 +240,13 @@ namespace AutoSwitch
                     LogToFile("FABRIC | id=" + fabricId +
                               " | members=" + fabric.Count.ToString(CultureInfo.InvariantCulture) +
                               " | estCapacityGbps=" + speed.ToString("0.##", CultureInfo.InvariantCulture) +
-                              " | bundleCableIds=" + tracked.ToString(CultureInfo.InvariantCulture) +
+                              " | bundledCableIds=" + tracked.ToString(CultureInfo.InvariantCulture) +
                               " | switches=" + members);
 
                     if (tracked > 0)
-                    {
-                        string cableList = string.Join(",", FabricIdToBundleCableIds[fabricId].OrderBy(x => x));
-                        LogToFile("FABRIC BUNDLE CABLE MAP | fabricId=" + fabricId + " | cableIds=[" + cableList + "]");
-                    }
+                        LogToFile("FABRIC BUNDLE CABLE MAP | fabricId=" + fabricId + " | cableIds=[" + string.Join(",", cableIds.Distinct().OrderBy(x => x)) + "]");
 
-                    fabricIndex++;
+                    logIndex++;
                 }
             }
         }
@@ -198,35 +255,11 @@ namespace AutoSwitch
         {
             try
             {
-                _networkMapType = AccessTools.TypeByName("Il2Cpp.NetworkMap");
-
-                if (_networkMapType != null)
+                Type networkMapType = AccessTools.TypeByName("Il2Cpp.NetworkMap");
+                if (networkMapType != null)
                 {
-                    PatchIfFound(_networkMapType, "RegisterSwitch", nameof(NetworkMap_RegisterSwitch_Postfix), patchPostfix: true);
-                    PatchIfFound(_networkMapType, "RegisterCableConnection", nameof(NetworkMap_RegisterCableConnection_Postfix), patchPostfix: true);
-
-                    PatchIfFound(_networkMapType, "FindAllRoutes",
-                        nameof(NetworkMap_FindAllRoutes_Postfix),
-                        patchPostfix: true,
-                        patchPrefixName: nameof(NetworkMap_FindAllRoutes_Prefix));
-
-                    PatchIfFound(_networkMapType, "FindPhysicalPath",
-                        nameof(NetworkMap_FindPhysicalPath_Postfix),
-                        patchPostfix: true,
-                        patchPrefixName: nameof(NetworkMap_FindPhysicalPath_Prefix));
-
-                    PatchIfFound(_networkMapType, "UpdateCustomerServerCountAndSpeed",
-                        nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Postfix),
-                        patchPostfix: true,
-                        patchPrefixName: nameof(NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix));
-
-                    PatchIfFound(_networkMapType, "GetLACPGroupForCable",
-                        nameof(NetworkMap_GetLACPGroupForCable_Postfix),
-                        patchPostfix: true);
-
-                    PatchIfFound(_networkMapType, "GetLACPGroupBetween",
-                        nameof(NetworkMap_GetLACPGroupBetween_Postfix),
-                        patchPostfix: true);
+                    PatchIfFound(networkMapType, "RegisterSwitch", nameof(NetworkMap_RegisterSwitch_Postfix));
+                    PatchIfFound(networkMapType, "RegisterCableConnection", nameof(NetworkMap_RegisterCableConnection_Postfix));
                 }
             }
             catch (Exception ex)
@@ -235,7 +268,7 @@ namespace AutoSwitch
             }
         }
 
-        private void PatchIfFound(Type type, string methodName, string postfixName = null, bool patchPostfix = false, string patchPrefixName = null)
+        private void PatchIfFound(Type type, string methodName, string postfixName)
         {
             try
             {
@@ -246,24 +279,14 @@ namespace AutoSwitch
                     return;
                 }
 
-                HarmonyMethod prefix = null;
-                HarmonyMethod postfix = null;
-
-                if (!string.IsNullOrWhiteSpace(patchPrefixName))
+                MethodInfo postfixMethod = typeof(AutoSwitchMod).GetMethod(postfixName, BindingFlags.NonPublic | BindingFlags.Static);
+                if (postfixMethod == null)
                 {
-                    MethodInfo prefixMethod = typeof(AutoSwitchMod).GetMethod(patchPrefixName, BindingFlags.NonPublic | BindingFlags.Static);
-                    if (prefixMethod != null)
-                        prefix = new HarmonyMethod(prefixMethod);
+                    LogToFile("PATCH MISS POSTFIX | " + postfixName);
+                    return;
                 }
 
-                if (patchPostfix && !string.IsNullOrWhiteSpace(postfixName))
-                {
-                    MethodInfo postfixMethod = typeof(AutoSwitchMod).GetMethod(postfixName, BindingFlags.NonPublic | BindingFlags.Static);
-                    if (postfixMethod != null)
-                        postfix = new HarmonyMethod(postfixMethod);
-                }
-
-                HarmonyInstance.Patch(target, prefix: prefix, postfix: postfix);
+                HarmonyInstance.Patch(target, postfix: new HarmonyMethod(postfixMethod));
                 LogPatch("Patched " + type.FullName + "." + methodName);
             }
             catch (Exception ex)
@@ -290,13 +313,6 @@ namespace AutoSwitch
                     return;
 
                 RegisteredSwitches[info.DeviceName] = info;
-
-                LogToFile("REGISTER SWITCH | deviceName=" + info.DeviceName +
-                          " | model=" + info.ModelName +
-                          " | pos=(" +
-                          info.WorldPosition.x.ToString("0.###", CultureInfo.InvariantCulture) + "," +
-                          info.WorldPosition.y.ToString("0.###", CultureInfo.InvariantCulture) + "," +
-                          info.WorldPosition.z.ToString("0.###", CultureInfo.InvariantCulture) + ")");
             }
             catch (Exception ex)
             {
@@ -333,16 +349,6 @@ namespace AutoSwitch
                 info.ServerRootKeyB = ResolveServerRootKey(__4, __10, __6);
 
                 RegisteredCables[__0] = info;
-
-                LogToFile("REGISTER CABLE | cableId=" + info.CableId.ToString(CultureInfo.InvariantCulture) +
-                          " | deviceA=" + info.DeviceA +
-                          " | deviceB=" + info.DeviceB +
-                          " | extraA=" + info.ExtraA +
-                          " | extraB=" + info.ExtraB +
-                          " | serverRootA=" + info.ServerRootKeyA +
-                          " | serverRootB=" + info.ServerRootKeyB +
-                          " | portA=" + info.PortA.ToString(CultureInfo.InvariantCulture) +
-                          " | portB=" + info.PortB.ToString(CultureInfo.InvariantCulture));
             }
             catch (Exception ex)
             {
@@ -350,398 +356,177 @@ namespace AutoSwitch
             }
         }
 
-        private static void NetworkMap_FindAllRoutes_Prefix(string __0, string __1)
+        internal static NetworkSaveData GetNetworkSaveData()
         {
             try
             {
-                if (!IsInterestingRouteRequest(__0, __1))
-                    return;
+                MainGameManager mgm = MainGameManager.instance;
+                if (mgm == null)
+                    return null;
 
-                LogOnce("FindAllRoutesPRE|" + __0 + "|" + __1,
-                    "ROUTE PATH | FindAllRoutes PRE | base=" + __0 + " | server=" + __1);
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_FindAllRoutes_Postfix(string __0, string __1, object __result)
-        {
-            try
-            {
-                if (!IsInterestingRouteRequest(__0, __1))
-                    return;
-
-                LogToFile("ROUTE PATH | FindAllRoutes POST | base=" + __0 +
-                          " | server=" + __1 +
-                          " | routes=" + FormatNestedRoutes(__result));
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_FindPhysicalPath_Prefix(string __0, string __1)
-        {
-            try
-            {
-                if (!IsInterestingRouteRequest(__0, __1))
-                    return;
-
-                LogOnce("FindPhysicalPathPRE|" + __0 + "|" + __1,
-                    "ROUTE PATH | FindPhysicalPath PRE | start=" + __0 + " | target=" + __1);
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_FindPhysicalPath_Postfix(string __0, string __1, object __result)
-        {
-            try
-            {
-                if (!IsInterestingRouteRequest(__0, __1))
-                    return;
-
-                LogToFile("ROUTE PATH | FindPhysicalPath POST | start=" + __0 +
-                          " | target=" + __1 +
-                          " | path=" + FormatStringList(__result));
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_UpdateCustomerServerCountAndSpeed_Prefix(int __0, int __1, float __2)
-        {
-            try
-            {
-                LogOnce("UpdateCustomerPRE|" + __0.ToString(CultureInfo.InvariantCulture) + "|" + __1.ToString(CultureInfo.InvariantCulture) + "|" + __2.ToString("0.##", CultureInfo.InvariantCulture),
-                    "THROUGHPUT | UpdateCustomerServerCountAndSpeed PRE | customerId=" + __0.ToString(CultureInfo.InvariantCulture) +
-                    " | serverCount=" + __1.ToString(CultureInfo.InvariantCulture) +
-                    " | speed=" + __2.ToString("0.##", CultureInfo.InvariantCulture));
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_UpdateCustomerServerCountAndSpeed_Postfix(int __0, int __1, float __2)
-        {
-            try
-            {
-                LogToFile("THROUGHPUT | UpdateCustomerServerCountAndSpeed POST | customerId=" + __0.ToString(CultureInfo.InvariantCulture) +
-                          " | serverCount=" + __1.ToString(CultureInfo.InvariantCulture) +
-                          " | speed=" + __2.ToString("0.##", CultureInfo.InvariantCulture));
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_GetLACPGroupForCable_Postfix(int __0, object __result)
-        {
-            try
-            {
-                if (!WatchedCableIds.Contains(__0))
-                    return;
-
-                LogToFile("LACP QUERY | GetLACPGroupForCable | cableId=" + __0.ToString(CultureInfo.InvariantCulture) +
-                          " | result=" + FormatLacpGroup(__result));
-            }
-            catch
-            {
-            }
-        }
-
-        private static void NetworkMap_GetLACPGroupBetween_Postfix(string __0, string __1, object __result)
-        {
-            try
-            {
-                if (!StringLooksWatchedDevice(__0) && !StringLooksWatchedDevice(__1))
-                    return;
-
-                LogToFile("LACP QUERY | GetLACPGroupBetween | deviceA=" + __0 +
-                          " | deviceB=" + __1 +
-                          " | result=" + FormatLacpGroup(__result));
-            }
-            catch
-            {
-            }
-        }
-
-        private void DetectRemoteDeviceBundles(List<List<RegisteredSwitchInfo>> fabrics)
-        {
-            FabricIdToSpeed.Clear();
-            FabricIdToBundleCableIds.Clear();
-            WatchedCableIds.Clear();
-            WatchedDevices.Clear();
-
-            int index = 1;
-
-            foreach (List<RegisteredSwitchInfo> fabric in fabrics)
-            {
-                string fabricId = "FABRIC-" + index.ToString("000", CultureInfo.InvariantCulture);
-                float fabricSpeed = fabric.Sum(x => x.EstimatedCapacityGbps);
-                FabricIdToSpeed[fabricId] = fabricSpeed;
-                FabricIdToBundleCableIds[fabricId] = new HashSet<int>();
-
-                HashSet<string> fabricDevices = new HashSet<string>(
-                    fabric.Select(x => x.DeviceName).Where(x => !string.IsNullOrWhiteSpace(x)),
-                    StringComparer.OrdinalIgnoreCase);
-
-                Dictionary<string, List<RegisteredCableInfo>> remoteBundles =
-                    new Dictionary<string, List<RegisteredCableInfo>>(StringComparer.OrdinalIgnoreCase);
-
-                foreach (RegisteredCableInfo cable in RegisteredCables.Values)
+                object[] roots =
                 {
-                    bool aIn = fabricDevices.Contains(cable.DeviceA);
-                    bool bIn = fabricDevices.Contains(cable.DeviceB);
+                    TryGetMemberValue(mgm, "currentSaveData"),
+                    TryGetMemberValue(mgm, "saveData"),
+                    TryGetMemberValue(mgm, "loadedSaveData"),
+                    TryGetMemberValue(mgm, "currentSave"),
+                };
 
-                    if (aIn && bIn)
-                    {
-                        FabricIdToBundleCableIds[fabricId].Add(cable.CableId);
-                        if (!string.IsNullOrWhiteSpace(cable.DeviceA)) WatchedDevices.Add(cable.DeviceA);
-                        if (!string.IsNullOrWhiteSpace(cable.DeviceB)) WatchedDevices.Add(cable.DeviceB);
-                        continue;
-                    }
-
-                    if (aIn == bIn)
-                        continue;
-
-                    string remoteKey = aIn
-                        ? BuildExactRemoteDeviceKey(cable, true)
-                        : BuildExactRemoteDeviceKey(cable, false);
-
-                    if (string.IsNullOrWhiteSpace(remoteKey))
-                        continue;
-
-                    List<RegisteredCableInfo> bundle;
-                    if (!remoteBundles.TryGetValue(remoteKey, out bundle))
-                    {
-                        bundle = new List<RegisteredCableInfo>();
-                        remoteBundles[remoteKey] = bundle;
-                    }
-
-                    bundle.Add(cable);
-                }
-
-                foreach (KeyValuePair<string, List<RegisteredCableInfo>> kvp in remoteBundles)
+                foreach (object root in roots)
                 {
-                    List<RegisteredCableInfo> bundle = kvp.Value;
-                    if (bundle.Count < 2)
-                        continue;
-
-                    foreach (RegisteredCableInfo cable in bundle)
-                    {
-                        FabricIdToBundleCableIds[fabricId].Add(cable.CableId);
-                        WatchedCableIds.Add(cable.CableId);
-
-                        if (!string.IsNullOrWhiteSpace(cable.DeviceA)) WatchedDevices.Add(cable.DeviceA);
-                        if (!string.IsNullOrWhiteSpace(cable.DeviceB)) WatchedDevices.Add(cable.DeviceB);
-                    }
-
-                    string cableList = string.Join(",", bundle.Select(x => x.CableId).OrderBy(x => x));
-                    string logKey = fabricId + "|" + kvp.Key + "|" + bundle.Count.ToString(CultureInfo.InvariantCulture) + "|" + cableList;
-                    if (LoggedBundles.Add(logKey))
-                    {
-                        LogToFile("REMOTE DEVICE BUNDLE | fabricId=" + fabricId +
-                                  " | remoteKey=" + kvp.Key +
-                                  " | cableCount=" + bundle.Count.ToString(CultureInfo.InvariantCulture) +
-                                  " | estPerCableGbps=" + (fabricSpeed / bundle.Count).ToString("0.##", CultureInfo.InvariantCulture) +
-                                  " | cableIds=[" + cableList + "]");
-                    }
+                    NetworkSaveData data = ExtractNetworkSaveData(root);
+                    if (data != null)
+                        return data;
                 }
-
-                index++;
             }
-        }
-
-        private static bool IsInterestingRouteRequest(string a, string b)
-        {
-            if (StringLooksWatchedDevice(a) || StringLooksWatchedDevice(b))
-                return true;
-
-            if (!string.IsNullOrWhiteSpace(a) && a.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            if (!string.IsNullOrWhiteSpace(b) && b.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            return false;
-        }
-
-        private static bool StringLooksWatchedDevice(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-                return false;
-
-            if (WatchedDevices.Contains(value))
-                return true;
-
-            foreach (RegisteredCableInfo cable in RegisteredCables.Values)
+            catch (Exception ex)
             {
-                if (!WatchedCableIds.Contains(cable.CableId))
+                LogToFile("GetNetworkSaveData failed: " + ex);
+            }
+
+            return null;
+        }
+
+        private static NetworkSaveData ExtractNetworkSaveData(object root)
+        {
+            if (root == null)
+                return null;
+
+            NetworkSaveData direct = root as NetworkSaveData;
+            if (direct != null)
+                return direct;
+
+            object[] nested =
+            {
+                TryGetMemberValue(root, "networkSaveData"),
+                TryGetMemberValue(root, "networkData"),
+                TryGetMemberValue(root, "networkSave"),
+            };
+
+            foreach (object candidate in nested)
+            {
+                NetworkSaveData cast = candidate as NetworkSaveData;
+                if (cast != null)
+                    return cast;
+            }
+
+            return null;
+        }
+
+        private static List<CableSaveInfo> ReadAllSaveCables(NetworkSaveData networkSaveData)
+        {
+            List<CableSaveInfo> result = new List<CableSaveInfo>();
+            if (networkSaveData == null || networkSaveData.cables == null)
+                return result;
+
+            foreach (CableSaveData cable in networkSaveData.cables)
+            {
+                if (cable == null)
                     continue;
 
-                if (string.Equals(cable.DeviceA, value, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cable.DeviceB, value, StringComparison.OrdinalIgnoreCase))
-                    return true;
+                result.Add(new CableSaveInfo
+                {
+                    CableId = cable.cableID,
+                    StartToken = EndpointToken(cable.startPoint),
+                    EndToken = EndpointToken(cable.endPoint)
+                });
+            }
+
+            return result;
+        }
+
+        private static Dictionary<string, BundleBuilder> BuildBundlesForFabric(
+            HashSet<string> localIds,
+            List<CableSaveInfo> allCables)
+        {
+            Dictionary<string, BundleBuilder> result =
+                new Dictionary<string, BundleBuilder>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (CableSaveInfo cable in allCables)
+            {
+                if (cable == null)
+                    continue;
+
+                string localDeviceId;
+                string remoteDeviceId;
+                if (!TryResolveRemoteDevice(cable, localIds, out localDeviceId, out remoteDeviceId))
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(localDeviceId) || string.IsNullOrWhiteSpace(remoteDeviceId))
+                    continue;
+
+                string key = localDeviceId + "||" + remoteDeviceId;
+                BundleBuilder builder;
+                if (!result.TryGetValue(key, out builder))
+                {
+                    builder = new BundleBuilder();
+                    builder.LocalDeviceId = localDeviceId;
+                    builder.RemoteDeviceId = remoteDeviceId;
+                    result[key] = builder;
+                }
+
+                builder.CableIds.Add(cable.CableId);
+            }
+
+            return result;
+        }
+
+        private static bool TryResolveRemoteDevice(
+            CableSaveInfo cable,
+            HashSet<string> localIds,
+            out string localDeviceId,
+            out string remoteDeviceId)
+        {
+            localDeviceId = null;
+            remoteDeviceId = null;
+
+            if (cable == null)
+                return false;
+
+            bool startIsLocal = !string.IsNullOrWhiteSpace(cable.StartToken) && localIds.Contains(cable.StartToken);
+            bool endIsLocal = !string.IsNullOrWhiteSpace(cable.EndToken) && localIds.Contains(cable.EndToken);
+
+            if (startIsLocal && !string.IsNullOrWhiteSpace(cable.EndToken))
+            {
+                localDeviceId = cable.StartToken;
+                remoteDeviceId = cable.EndToken;
+                return true;
+            }
+
+            if (endIsLocal && !string.IsNullOrWhiteSpace(cable.StartToken))
+            {
+                localDeviceId = cable.EndToken;
+                remoteDeviceId = cable.StartToken;
+                return true;
             }
 
             return false;
         }
 
-        private static void LogOnce(string key, string message)
+        internal static bool GroupTouchesManagedIds(LACPGroupSaveData group, HashSet<string> managedIds)
         {
-            if (LoggedProbeEvents.Add(key))
-                LogToFile(message);
+            if (group == null)
+                return false;
+
+            return (!string.IsNullOrWhiteSpace(group.deviceA) && managedIds.Contains(group.deviceA)) ||
+                   (!string.IsNullOrWhiteSpace(group.deviceB) && managedIds.Contains(group.deviceB));
         }
 
-        private static string FormatNestedRoutes(object raw)
+        internal static string EndpointToken(CableEndpointSaveData endpoint)
         {
-            if (raw == null)
-                return "<null>";
+            if (endpoint == null)
+                return null;
 
-            try
-            {
-                IEnumerable outer = raw as IEnumerable;
-                if (outer == null || raw is string)
-                    return raw.ToString();
+            if (!string.IsNullOrWhiteSpace(endpoint.switchID))
+                return endpoint.switchID;
 
-                List<string> groups = new List<string>();
-                int outerCount = 0;
+            if (!string.IsNullOrWhiteSpace(endpoint.serverID))
+                return endpoint.serverID;
 
-                foreach (object inner in outer)
-                {
-                    if (outerCount >= 8)
-                    {
-                        groups.Add("...");
-                        break;
-                    }
+            if (endpoint.customerID >= 0)
+                return "Customer_" + endpoint.customerID.ToString(CultureInfo.InvariantCulture);
 
-                    groups.Add("[" + FormatStringList(inner) + "]");
-                    outerCount++;
-                }
-
-                return string.Join(" | ", groups);
-            }
-            catch
-            {
-                return "<err>";
-            }
-        }
-
-        private static string FormatStringList(object raw)
-        {
-            if (raw == null)
-                return "<null>";
-
-            try
-            {
-                IEnumerable enumerable = raw as IEnumerable;
-                if (enumerable == null || raw is string)
-                    return raw.ToString();
-
-                List<string> items = new List<string>();
-                int count = 0;
-
-                foreach (object item in enumerable)
-                {
-                    if (count >= 20)
-                    {
-                        items.Add("...");
-                        break;
-                    }
-
-                    items.Add(item == null ? "<null>" : item.ToString());
-                    count++;
-                }
-
-                return string.Join(" -> ", items);
-            }
-            catch
-            {
-                return "<err>";
-            }
-        }
-
-        private static string FormatLacpGroup(object groupObj)
-        {
-            if (groupObj == null)
-                return "<null>";
-
-            try
-            {
-                object groupId = TryGetMemberValue(groupObj, "groupId");
-                object deviceA = TryGetMemberValue(groupObj, "deviceA");
-                object deviceB = TryGetMemberValue(groupObj, "deviceB");
-                List<int> cableIds = ExtractIntList(TryGetMemberValue(groupObj, "cableIds"));
-
-                return "groupId=" + SafeString(groupId) +
-                       ",deviceA=" + SafeString(deviceA) +
-                       ",deviceB=" + SafeString(deviceB) +
-                       ",cableIds=[" + string.Join(",", cableIds.OrderBy(x => x)) + "]";
-            }
-            catch
-            {
-                return groupObj.GetType().Name;
-            }
-        }
-
-        private static string SafeString(object value)
-        {
-            return value == null ? "<null>" : Convert.ToString(value, CultureInfo.InvariantCulture);
-        }
-
-        private static string BuildExactRemoteDeviceKey(RegisteredCableInfo cable, bool sideAIsLocal)
-        {
-            string remoteDevice = sideAIsLocal ? cable.DeviceB : cable.DeviceA;
-            string remoteExtra = sideAIsLocal ? cable.ExtraB : cable.ExtraA;
-            string remoteServerRoot = sideAIsLocal ? cable.ServerRootKeyB : cable.ServerRootKeyA;
-            object remoteEndpointObj = sideAIsLocal ? cable.EndpointObjectB : cable.EndpointObjectA;
-
-            if (!string.IsNullOrWhiteSpace(remoteDevice) &&
-                remoteDevice.StartsWith("Switch", StringComparison.OrdinalIgnoreCase))
-            {
-                return "REMOTE_SWITCH_DEVICE:" + remoteDevice.Trim();
-            }
-
-            if (!string.IsNullOrWhiteSpace(remoteServerRoot) &&
-                remoteServerRoot.StartsWith("SERVERROOT:", StringComparison.OrdinalIgnoreCase))
-            {
-                return "REMOTE_SERVER_ROOT:" + remoteServerRoot;
-            }
-
-            string endpointRoot = ResolveEndpointRootKey(remoteEndpointObj, remoteExtra, remoteDevice);
-            if (!string.IsNullOrWhiteSpace(endpointRoot))
-            {
-                if (endpointRoot.StartsWith("SWITCHROOT:", StringComparison.OrdinalIgnoreCase))
-                    return "REMOTE_SWITCH_ROOT:" + endpointRoot;
-
-                if (endpointRoot.StartsWith("SERVERROOT:", StringComparison.OrdinalIgnoreCase))
-                    return "REMOTE_SERVER_ROOT:" + endpointRoot;
-            }
-
-            if (!string.IsNullOrWhiteSpace(remoteServerRoot) &&
-                remoteServerRoot.StartsWith("SERVERFAMILY:", StringComparison.OrdinalIgnoreCase))
-            {
-                return "REMOTE_SERVER_FAMILY:" + remoteServerRoot;
-            }
-
-            if (!string.IsNullOrWhiteSpace(remoteExtra) &&
-                remoteExtra.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-            {
-                return "REMOTE_SERVER_FAMILY:" + NormalizeRuntimeIdentity(remoteExtra);
-            }
-
-            if (!string.IsNullOrWhiteSpace(remoteDevice) &&
-                remoteDevice.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-            {
-                return "REMOTE_SERVER_FAMILY:" + NormalizeRuntimeIdentity(remoteDevice);
-            }
-
-            return string.Empty;
+            return null;
         }
 
         private static RegisteredSwitchInfo BuildRegisteredSwitchInfo(object networkSwitchObj)
@@ -794,8 +579,7 @@ namespace AutoSwitch
             if (string.IsNullOrWhiteSpace(modelName))
                 return false;
 
-            string normalized = NormalizeCloneName(modelName);
-            return AllowedSwitchModels.Contains(normalized);
+            return AllowedSwitchModels.Contains(NormalizeCloneName(modelName));
         }
 
         private static bool IsLikelyPlacedSwitch(RegisteredSwitchInfo info)
@@ -880,47 +664,7 @@ namespace AutoSwitch
                 return false;
 
             float actualStep = Mathf.Abs(a.WorldPosition.y - b.WorldPosition.y);
-            float expectedStep = FallbackExpectedStep;
-
-            return Mathf.Abs(actualStep - expectedStep) <= AdjacentYTolerance;
-        }
-
-        private static string ResolveEndpointRootKey(object endpointObj, string extraName, string deviceName)
-        {
-            GameObject endpointGo = DiscoverGameObject(endpointObj);
-            if (endpointGo != null)
-            {
-                Transform current = endpointGo.transform;
-                int depth = 0;
-
-                while (current != null && depth < 16)
-                {
-                    string n = NormalizeCloneName(current.name);
-
-                    if (n.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-                        return "SERVERROOT:" + n + "#" + current.gameObject.GetInstanceID().ToString(CultureInfo.InvariantCulture);
-
-                    if (n.StartsWith("Switch", StringComparison.OrdinalIgnoreCase))
-                        return "SWITCHROOT:" + n + "#" + current.gameObject.GetInstanceID().ToString(CultureInfo.InvariantCulture);
-
-                    current = current.parent;
-                    depth++;
-                }
-            }
-
-            string raw = !string.IsNullOrWhiteSpace(extraName) ? extraName : deviceName;
-            if (!string.IsNullOrWhiteSpace(raw))
-            {
-                string normalized = NormalizeRuntimeIdentity(raw);
-
-                if (normalized.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-                    return "SERVERFAMILY:" + normalized;
-
-                if (normalized.StartsWith("Switch", StringComparison.OrdinalIgnoreCase))
-                    return "SWITCHFAMILY:" + normalized;
-            }
-
-            return string.Empty;
+            return Mathf.Abs(actualStep - FallbackExpectedStep) <= AdjacentYTolerance;
         }
 
         private static string ResolveServerRootKey(object endpointObj, string extraName, string deviceName)
@@ -944,10 +688,7 @@ namespace AutoSwitch
 
             string raw = !string.IsNullOrWhiteSpace(extraName) ? extraName : deviceName;
             if (!string.IsNullOrWhiteSpace(raw) && raw.StartsWith("Server.", StringComparison.OrdinalIgnoreCase))
-            {
-                string normalized = NormalizeRuntimeIdentity(raw);
-                return "SERVERFAMILY:" + normalized;
-            }
+                return "SERVERFAMILY:" + NormalizeRuntimeIdentity(raw);
 
             return string.Empty;
         }
@@ -963,9 +704,7 @@ namespace AutoSwitch
                 if (go != null)
                     return go;
             }
-            catch
-            {
-            }
+            catch { }
 
             try
             {
@@ -973,9 +712,7 @@ namespace AutoSwitch
                 if (comp != null)
                     return comp.gameObject;
             }
-            catch
-            {
-            }
+            catch { }
 
             try
             {
@@ -984,9 +721,7 @@ namespace AutoSwitch
                 if (gameObject != null)
                     return gameObject;
             }
-            catch
-            {
-            }
+            catch { }
 
             try
             {
@@ -995,9 +730,7 @@ namespace AutoSwitch
                 if (t != null)
                     return t.gameObject;
             }
-            catch
-            {
-            }
+            catch { }
 
             return null;
         }
@@ -1032,9 +765,7 @@ namespace AutoSwitch
                     if (!string.IsNullOrWhiteSpace(s))
                         return s.Trim();
                 }
-                catch
-                {
-                }
+                catch { }
             }
 
             foreach (PropertyInfo p in SafeProperties(obj.GetType()))
@@ -1052,9 +783,7 @@ namespace AutoSwitch
                     if (!string.IsNullOrWhiteSpace(s))
                         return s.Trim();
                 }
-                catch
-                {
-                }
+                catch { }
             }
 
             return string.Empty;
@@ -1108,53 +837,9 @@ namespace AutoSwitch
                 if (field != null)
                     return field.GetValue(target);
             }
-            catch
-            {
-            }
+            catch { }
 
             return null;
-        }
-
-        private static List<int> ExtractIntList(object raw)
-        {
-            List<int> result = new List<int>();
-
-            if (raw == null)
-                return result;
-
-            try
-            {
-                if (raw is int)
-                {
-                    result.Add((int)raw);
-                    return result;
-                }
-
-                IEnumerable enumerable = raw as IEnumerable;
-                if (enumerable != null && !(raw is string))
-                {
-                    foreach (object item in enumerable)
-                    {
-                        if (item == null)
-                            continue;
-
-                        int parsed;
-                        if (int.TryParse(item.ToString(), out parsed))
-                            result.Add(parsed);
-                    }
-
-                    return result.Distinct().ToList();
-                }
-
-                int single;
-                if (int.TryParse(raw.ToString(), out single))
-                    result.Add(single);
-            }
-            catch
-            {
-            }
-
-            return result.Distinct().ToList();
         }
 
         private static string NormalizeCloneName(string name)
@@ -1177,16 +862,278 @@ namespace AutoSwitch
             return TrailingRuntimeIdRegex.Replace(raw.Trim(), "");
         }
 
-        private static void LogToFile(string message)
+        internal static void LogToFile(string message)
         {
             try
             {
                 Directory.CreateDirectory(DebugFolderPath);
                 File.AppendAllText(DebugLogPath, "[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] " + message + Environment.NewLine);
             }
-            catch
+            catch { }
+        }
+    }
+
+    internal static class SaveDataAutoLACP
+    {
+        private static bool _bootstrapStarted;
+        private static bool _regroupQueued;
+        private static float _lastRunRealtime;
+        private static string _lastAppliedSignature = string.Empty;
+
+        private const float InitialDelaySeconds = 8.0f;
+        private const float MinDelaySeconds = 0.35f;
+        private const float MinGapBetweenRunsSeconds = 0.50f;
+
+        private static readonly object _stateLock = new object();
+        private static List<BundleBuilder> _desiredBundles = new List<BundleBuilder>();
+        private static HashSet<string> _desiredManagedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        internal static void StartSafeBootstrap()
+        {
+            if (_bootstrapStarted)
+                return;
+
+            _bootstrapStarted = true;
+            MelonLogger.Msg("[AutoSwitch] Save-data Auto-LACP bootstrap armed.");
+            MelonCoroutines.Start(BootstrapRoutine());
+        }
+
+        internal static void ResetForScene()
+        {
+            _bootstrapStarted = false;
+            _regroupQueued = false;
+            _lastRunRealtime = 0f;
+            _lastAppliedSignature = string.Empty;
+
+            lock (_stateLock)
             {
+                _desiredBundles = new List<BundleBuilder>();
+                _desiredManagedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             }
+        }
+
+        private static IEnumerator BootstrapRoutine()
+        {
+            yield return new WaitForSeconds(InitialDelaySeconds);
+            QueueRegroup("safe bootstrap");
+        }
+
+        internal static void UpdateDesiredState(List<BundleBuilder> bundles, HashSet<string> managedIds)
+        {
+            if (bundles == null)
+                bundles = new List<BundleBuilder>();
+
+            if (managedIds == null)
+                managedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            string signature = BuildDesiredSignature(bundles, managedIds);
+
+            lock (_stateLock)
+            {
+                _desiredBundles = bundles
+                    .Select(CloneBundle)
+                    .OrderBy(b => b.FabricId)
+                    .ThenBy(b => b.LocalDeviceId)
+                    .ThenBy(b => b.RemoteDeviceId)
+                    .ToList();
+
+                _desiredManagedIds = new HashSet<string>(managedIds, StringComparer.OrdinalIgnoreCase);
+            }
+
+            if (!string.Equals(signature, _lastAppliedSignature, StringComparison.Ordinal))
+            {
+                _lastAppliedSignature = signature;
+                QueueRegroup("desired save-data bundles changed");
+            }
+        }
+
+        internal static void QueueRegroup(string reason)
+        {
+            if (_regroupQueued)
+                return;
+
+            _regroupQueued = true;
+            MelonLogger.Msg("[AutoSwitch] Save-data Auto-LACP queued: " + reason);
+            MelonCoroutines.Start(RunQueuedRegroup());
+        }
+
+        private static IEnumerator RunQueuedRegroup()
+        {
+            yield return new WaitForSeconds(MinDelaySeconds);
+
+            float now = Time.realtimeSinceStartup;
+            if (now - _lastRunRealtime < MinGapBetweenRunsSeconds)
+            {
+                _regroupQueued = false;
+                yield return new WaitForSeconds(MinGapBetweenRunsSeconds);
+                QueueRegroup("debounced");
+                yield break;
+            }
+
+            _regroupQueued = false;
+            _lastRunRealtime = Time.realtimeSinceStartup;
+
+            try
+            {
+                RebuildAutoLacpGroups();
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("[AutoSwitch] Save-data Auto-LACP regroup failed: " + ex);
+                AutoSwitchMod.LogToFile("Save-data Auto-LACP regroup failed: " + ex);
+            }
+        }
+
+        internal static void RebuildAutoLacpGroups()
+        {
+            List<BundleBuilder> desiredBundles;
+            HashSet<string> desiredManagedIds;
+
+            lock (_stateLock)
+            {
+                desiredBundles = _desiredBundles.Select(CloneBundle).ToList();
+                desiredManagedIds = new HashSet<string>(_desiredManagedIds, StringComparer.OrdinalIgnoreCase);
+            }
+
+            NetworkMap networkMap = NetworkMap.instance;
+            NetworkSaveData networkSaveData = AutoSwitchMod.GetNetworkSaveData();
+
+            if (networkMap == null)
+            {
+                AutoSwitchMod.LogToFile("AUTO LACP | skipped, NetworkMap.instance is null.");
+                return;
+            }
+
+            List<int> removedGroupIds = new List<int>();
+
+            if (networkSaveData != null && networkSaveData.lacpGroups != null)
+            {
+                foreach (LACPGroupSaveData existing in networkSaveData.lacpGroups)
+                {
+                    if (AutoSwitchMod.GroupTouchesManagedIds(existing, desiredManagedIds))
+                        removedGroupIds.Add(existing.groupId);
+                }
+            }
+
+            foreach (int groupId in removedGroupIds.Distinct().OrderBy(x => x))
+            {
+                try
+                {
+                    networkMap.RemoveLACPGroup(groupId);
+                }
+                catch (Exception ex)
+                {
+                    AutoSwitchMod.LogToFile("AUTO LACP | RemoveLACPGroup failed for " + groupId.ToString(CultureInfo.InvariantCulture) + " | " + ex.Message);
+                }
+            }
+
+            if (networkSaveData != null)
+            {
+                List<LACPGroupSaveData> rebuiltSaveGroups = new List<LACPGroupSaveData>();
+
+                if (networkSaveData.lacpGroups != null)
+                {
+                    foreach (LACPGroupSaveData existing in networkSaveData.lacpGroups)
+                    {
+                        if (!AutoSwitchMod.GroupTouchesManagedIds(existing, desiredManagedIds))
+                            rebuiltSaveGroups.Add(existing);
+                    }
+                }
+
+                foreach (BundleBuilder bundle in desiredBundles)
+                {
+                    List<int> distinctIds = bundle.CableIds.Distinct().OrderBy(x => x).ToList();
+                    if (distinctIds.Count < 2)
+                        continue;
+
+                    try
+                    {
+                        Il2CppSystem.Collections.Generic.List<int> il2cppCableIds = new Il2CppSystem.Collections.Generic.List<int>();
+                        foreach (int cableId in distinctIds)
+                            il2cppCableIds.Add(cableId);
+
+                        int groupId = networkMap.CreateLACPGroup(bundle.LocalDeviceId, bundle.RemoteDeviceId, il2cppCableIds);
+
+                        try
+                        {
+                            LACPGroupSaveData saveGroup = new LACPGroupSaveData();
+                            saveGroup.groupId = groupId;
+                            saveGroup.deviceA = bundle.LocalDeviceId;
+                            saveGroup.deviceB = bundle.RemoteDeviceId;
+                            saveGroup.cableIds = il2cppCableIds;
+                            rebuiltSaveGroups.Add(saveGroup);
+                        }
+                        catch (Exception ex)
+                        {
+                            AutoSwitchMod.LogToFile("AUTO LACP | save group construct failed for " +
+                                                    bundle.LocalDeviceId + " -> " + bundle.RemoteDeviceId + " | " + ex.Message);
+                        }
+
+                        AutoSwitchMod.LogToFile("AUTO LACP | created groupId=" + groupId.ToString(CultureInfo.InvariantCulture) +
+                                                " | fabricId=" + bundle.FabricId +
+                                                " | deviceA=" + bundle.LocalDeviceId +
+                                                " | deviceB=" + bundle.RemoteDeviceId +
+                                                " | cableIds=[" + string.Join(",", distinctIds) + "]");
+                    }
+                    catch (Exception ex)
+                    {
+                        AutoSwitchMod.LogToFile("AUTO LACP | CreateLACPGroup failed | deviceA=" + bundle.LocalDeviceId +
+                                                " | deviceB=" + bundle.RemoteDeviceId +
+                                                " | " + ex);
+                    }
+                }
+
+                try
+                {
+                    Il2CppSystem.Collections.Generic.List<LACPGroupSaveData> saveList = new Il2CppSystem.Collections.Generic.List<LACPGroupSaveData>();
+                    foreach (LACPGroupSaveData group in rebuiltSaveGroups)
+                        saveList.Add(group);
+
+                    networkSaveData.lacpGroups = saveList;
+                }
+                catch (Exception ex)
+                {
+                    AutoSwitchMod.LogToFile("AUTO LACP | failed updating networkSaveData.lacpGroups | " + ex);
+                }
+            }
+
+            AutoSwitchMod.LogToFile("AUTO LACP | regroup complete | removed=" +
+                                    removedGroupIds.Distinct().Count().ToString(CultureInfo.InvariantCulture) +
+                                    " | desiredBundles=" + desiredBundles.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private static string BuildDesiredSignature(List<BundleBuilder> bundles, HashSet<string> managedIds)
+        {
+            List<string> parts = new List<string>();
+
+            foreach (BundleBuilder bundle in bundles
+                .OrderBy(b => b.FabricId)
+                .ThenBy(b => b.LocalDeviceId)
+                .ThenBy(b => b.RemoteDeviceId))
+            {
+                parts.Add(bundle.FabricId + "|" +
+                          bundle.LocalDeviceId + "|" +
+                          bundle.RemoteDeviceId + "|" +
+                          string.Join(",", bundle.CableIds.Distinct().OrderBy(x => x)));
+            }
+
+            parts.Add("managed:" + string.Join(",", managedIds.OrderBy(x => x)));
+
+            return string.Join(" || ", parts);
+        }
+
+        private static BundleBuilder CloneBundle(BundleBuilder source)
+        {
+            BundleBuilder clone = new BundleBuilder();
+            clone.FabricId = source.FabricId;
+            clone.FabricEstimatedSpeedGbps = source.FabricEstimatedSpeedGbps;
+            clone.LocalDeviceId = source.LocalDeviceId;
+            clone.RemoteDeviceId = source.RemoteDeviceId;
+
+            foreach (int cableId in source.CableIds)
+                clone.CableIds.Add(cableId);
+
+            return clone;
         }
     }
 
@@ -1227,5 +1174,21 @@ namespace AutoSwitch
 
         public string ServerRootKeyA;
         public string ServerRootKeyB;
+    }
+
+    internal sealed class CableSaveInfo
+    {
+        public int CableId;
+        public string StartToken;
+        public string EndToken;
+    }
+
+    internal sealed class BundleBuilder
+    {
+        public string FabricId;
+        public float FabricEstimatedSpeedGbps;
+        public string LocalDeviceId;
+        public string RemoteDeviceId;
+        public readonly List<int> CableIds = new List<int>();
     }
 }
