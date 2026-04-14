@@ -1054,6 +1054,7 @@ namespace AutoSwitch
                 {
                     PatchIfFound(networkMapType, "RegisterSwitch", nameof(NetworkMap_RegisterSwitch_Postfix));
                     PatchIfFound(networkMapType, "RegisterCableConnection", nameof(NetworkMap_RegisterCableConnection_Postfix));
+                    PatchIfFound(networkMapType, "FindAllRoutes", nameof(NetworkMap_FindAllRoutes_Postfix));
                 }
             }
             catch (Exception ex)
@@ -1152,6 +1153,53 @@ namespace AutoSwitch
             }
         }
 
+        private static void NetworkMap_FindAllRoutes_Postfix(
+            object __instance,
+            string __0,
+            string __1,
+            ref List<List<string>> __result)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(__0) || string.IsNullOrWhiteSpace(__1))
+                    return;
+
+                Dictionary<string, HashSet<string>> graph = BuildAugmentedGraph(__instance);
+                if (graph.Count == 0)
+                    return;
+
+                List<string> route = FindAugmentedShortestPath(graph, __0, __1);
+                if (route == null || route.Count < 2)
+                    return;
+
+                if (__result == null)
+                    __result = new List<List<string>>();
+
+                string newSignature = string.Join(">", route);
+                foreach (List<string> existing in __result)
+                {
+                    if (existing == null)
+                        continue;
+
+                    if (string.Equals(string.Join(">", existing), newSignature, StringComparison.OrdinalIgnoreCase))
+                        return;
+                }
+
+                __result.Add(route);
+
+                LogToFile(
+                    "VIRTUAL ROUTE | start=" + __0 +
+                    " | target=" + __1 +
+                    " | hops=" + route.Count.ToString(CultureInfo.InvariantCulture) +
+                    " | path=[" + string.Join(" -> ", route) + "]"
+                );
+            }
+            catch (Exception ex)
+            {
+                LogToFile("NetworkMap_FindAllRoutes_Postfix failed: " + ex);
+            }
+        }
+
 
         private static readonly HashSet<string> InjectedVirtualEdgeSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1187,6 +1235,47 @@ namespace AutoSwitch
 
                     foreach (Tuple<string, string, string> edge in desiredEdges)
                         EnsureVirtualConnection(networkMap, edge.Item1, edge.Item2, plan.FabricId, plan.DomainId, edge.Item3);
+
+                    foreach (SyntheticShareLink shareLink in plan.SyntheticInternalShareLinks)
+                    {
+                        EnsureVirtualConnection(
+                            networkMap,
+                            shareLink.FromSwitchId,
+                            shareLink.ToSwitchId,
+                            plan.FabricId,
+                            plan.DomainId,
+                            "synthetic-share-" + (shareLink.Reason ?? "anchor-share"));
+                    }
+                }
+
+                foreach (FabricRuntimePlan plan in plans.OrderBy(p => p.FabricId, StringComparer.OrdinalIgnoreCase))
+                {
+                    foreach (DomainPropagationIntent intent in plan.DomainPropagationIntents)
+                    {
+                        string fromSwitch = intent.FromSwitchId;
+                        string toSwitch = intent.ToSwitchId;
+
+                        if (string.IsNullOrWhiteSpace(fromSwitch))
+                            fromSwitch = !string.IsNullOrWhiteSpace(plan.PreferredDomainUplinkSwitchId)
+                                ? plan.PreferredDomainUplinkSwitchId
+                                : plan.IngressAnchorSwitchId;
+
+                        FabricRuntimePlan targetPlan = plans.FirstOrDefault(p =>
+                            string.Equals(p.FabricId, intent.ToFabricId, StringComparison.OrdinalIgnoreCase));
+
+                        if (string.IsNullOrWhiteSpace(toSwitch) && targetPlan != null)
+                            toSwitch = !string.IsNullOrWhiteSpace(targetPlan.IngressAnchorSwitchId)
+                                ? targetPlan.IngressAnchorSwitchId
+                                : targetPlan.PreferredDomainUplinkSwitchId;
+
+                        EnsureVirtualConnection(
+                            networkMap,
+                            fromSwitch,
+                            toSwitch,
+                            plan.FabricId,
+                            plan.DomainId,
+                            "domain-propagation-" + (intent.IntentKind ?? "inter-fabric"));
+                    }
                 }
             }
             catch (Exception ex)
