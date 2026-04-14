@@ -1157,6 +1157,9 @@ namespace AutoSwitch
             object __instance,
             string __0,
             string __1,
+            // Keep as object for IL2CPP compatibility.
+            // Using ref List<List<string>> here fails Harmony patching against
+            // Il2CppSystem.Collections.Generic.List<Il2CppSystem.Collections.Generic.List<string>>.
             object __result)
         {
             try
