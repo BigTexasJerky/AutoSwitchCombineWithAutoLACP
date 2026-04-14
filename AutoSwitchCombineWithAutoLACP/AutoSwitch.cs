@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.19", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.20", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -109,7 +109,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.19 active. Cross-fabric managed-switch bundle suppression with Buttonpower-driven wake path and ID-agnostic anchor selection for public release.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.20 active. Direct NetworkSwitch.PowerButton wake path with public-release-safe ID-agnostic selection.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3698,14 +3698,6 @@ namespace AutoSwitch
 
             int invoked = 0;
 
-            try
-            {
-                invoked += TryInvokeButtonPowerInteraction(root);
-                if (invoked > 0)
-                    return invoked;
-            }
-            catch { }
-
             Component[] components;
             try
             {
@@ -3718,6 +3710,34 @@ namespace AutoSwitch
 
             if (components == null)
                 return 0;
+
+            foreach (Component component in components)
+            {
+                if (component == null)
+                    continue;
+
+                Type type = component.GetType();
+                if (type == null)
+                    continue;
+
+                string typeName = type.FullName ?? type.Name ?? string.Empty;
+                if (typeName.IndexOf("NetworkSwitch", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    int direct = 0;
+                    direct += TryInvokeCachedWakeBooleanMethod(component, "PowerButton", false);
+                    direct += TryInvokeCachedWakeBooleanMethod(component, "PowerButton", true);
+                    if (direct > 0)
+                        return direct;
+                }
+            }
+
+            try
+            {
+                invoked += TryInvokeButtonPowerInteraction(root);
+                if (invoked > 0)
+                    return invoked;
+            }
+            catch { }
 
             foreach (Component component in components)
             {
