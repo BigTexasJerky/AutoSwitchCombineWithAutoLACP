@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.8", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.9", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.8 active. Unified-fabric traffic pooling plus route augmentation.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.8 active. Unified-fabric pooling with route-only inter-fabric bridges.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -534,14 +534,14 @@ namespace AutoSwitch
             }
 
             SwitchTrafficProfile best = plan.SwitchProfiles.Values
-                .OrderByDescending(p => p.InterFabricSameDomainEdgeCount)
-                .ThenByDescending(p => p.DomainExitEdgeCount)
+                .OrderByDescending(p => p.DomainExitEdgeCount)
+                .ThenByDescending(p => p.InterFabricSameDomainEdgeCount)
                 .ThenByDescending(p => p.IngressScore)
                 .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
                 .FirstOrDefault();
 
             plan.PreferredDomainUplinkSwitchId =
-                best != null && best.InterFabricSameDomainEdgeCount > 0
+                best != null && (best.DomainExitEdgeCount > 0 || best.InterFabricSameDomainEdgeCount > 0)
                     ? best.DeviceId
                     : string.Empty;
         }
@@ -621,6 +621,17 @@ namespace AutoSwitch
             }
         }
 
+        private static bool IsRoutingOnlySyntheticEdge(RegisteredCableInfo cable)
+        {
+            if (cable == null)
+                return false;
+
+            string extraA = cable.ExtraA ?? string.Empty;
+            string extraB = cable.ExtraB ?? string.Empty;
+            return extraA.IndexOf("domain-propagation-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   extraB.IndexOf("domain-propagation-", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         private static SwitchTrafficProfile BuildSwitchTrafficProfile(
             string deviceId,
             string currentFabricId,
@@ -641,6 +652,9 @@ namespace AutoSwitch
                     continue;
 
                 if (externalLacpCableIds.Contains(cable.CableId))
+                    continue;
+
+                if (IsRoutingOnlySyntheticEdge(cable))
                     continue;
 
                 string localDeviceId;
@@ -691,14 +705,12 @@ namespace AutoSwitch
                 (profile.ExternalServerEdgeCount * 10.0f) +
                 (profile.ExternalUnknownEdgeCount * 6.0f) +
                 (profile.DomainExitEdgeCount * 5.0f) +
-                (profile.InterFabricSameDomainEdgeCount * 3.0f) +
                 (profile.InternalFabricEdgeCount * 0.25f);
 
             profile.CustomerBaseScore =
                 (profile.ExternalServerEdgeCount * 12.0f) +
                 (profile.ExternalUnknownEdgeCount * 9.0f) +
-                (profile.DomainExitEdgeCount * 2.0f) +
-                (profile.InterFabricSameDomainEdgeCount * 1.0f);
+                (profile.DomainExitEdgeCount * 2.0f);
 
             if (EndsWithRuntimeSuffix(profile.DeviceId, PreferredIngressSuffixHint))
                 profile.CustomerBaseScore += 250f;
@@ -759,6 +771,9 @@ namespace AutoSwitch
                     continue;
 
                 if (externalLacpCableIds.Contains(cable.CableId))
+                    continue;
+
+                if (IsRoutingOnlySyntheticEdge(cable))
                     continue;
 
                 string localDeviceId;
@@ -1646,6 +1661,8 @@ namespace AutoSwitch
             bool deviceConnectionsForced = false;
             bool cableMapForced = false;
             int virtualCableId = 0;
+            bool routingOnly = !string.IsNullOrWhiteSpace(reason) &&
+                reason.StartsWith("domain-propagation-", StringComparison.OrdinalIgnoreCase);
 
             try
             {
@@ -1663,11 +1680,15 @@ namespace AutoSwitch
                 }
 
                 adjacencyForced = ForceAdjacencyLink(networkMap, a, b) || hadAdjacencyBefore;
-                switchConnectionsForced = ForceSwitchConnectionsLink(networkMap, a, b);
-                deviceConnectionsForced = ForceDeviceConnectionsLink(networkMap, a, b);
-                cableMapForced = ForceCableConnectionMap(networkMap, a, b, signature, out virtualCableId);
-                if (cableMapForced && virtualCableId != 0)
-                    RegisterSyntheticCableInfo(virtualCableId, a, b, fabricId, domainId, reason);
+
+                if (!routingOnly)
+                {
+                    switchConnectionsForced = ForceSwitchConnectionsLink(networkMap, a, b);
+                    deviceConnectionsForced = ForceDeviceConnectionsLink(networkMap, a, b);
+                    cableMapForced = ForceCableConnectionMap(networkMap, a, b, signature, out virtualCableId);
+                    if (cableMapForced && virtualCableId != 0)
+                        RegisterSyntheticCableInfo(virtualCableId, a, b, fabricId, domainId, reason);
+                }
 
                 InjectedVirtualEdgeSignatures.Add(signature);
 
