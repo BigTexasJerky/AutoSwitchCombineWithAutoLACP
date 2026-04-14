@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.18", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.19", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -31,8 +31,6 @@ namespace AutoSwitch
         private const float MinUsefulWorldY = 1.0f;
         private const float MaxUsefulWorldY = 4.5f;
 
-        private const string PreferredIngressSuffixHint = "11186310";
-        private const string PreferredInterFabricSuffixHint = "4379640";
 
         private static readonly Regex TrailingRuntimeIdRegex =
             new Regex(@"_[\-]?\d+$", RegexOptions.Compiled);
@@ -111,7 +109,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.18 active. Cross-fabric managed-switch bundle suppression with generic switch power-state field/property wake for public release.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.19 active. Cross-fabric managed-switch bundle suppression with Buttonpower-driven wake path and ID-agnostic anchor selection for public release.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -539,41 +537,29 @@ namespace AutoSwitch
 
         private static void ChooseFabricAnchor(FabricRuntimePlan plan)
         {
-            SwitchTrafficProfile forcedHint = plan.SwitchProfiles.Values
+            SwitchTrafficProfile best = plan.SwitchProfiles.Values
                 .Where(p => p != null && IsCoreSwitchId(p.DeviceId))
-                .FirstOrDefault(p => EndsWithRuntimeSuffix(p.DeviceId, PreferredIngressSuffixHint));
+                .OrderByDescending(p => p.CustomerBaseScore)
+                .ThenByDescending(p => p.IngressScore)
+                .ThenByDescending(p => p.ExternalServerEdgeCount)
+                .ThenByDescending(p => p.ExternalUnknownEdgeCount)
+                .ThenByDescending(p => p.DomainExitEdgeCount)
+                .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
 
-            if (forcedHint != null)
+            if (best == null)
             {
-                plan.IngressAnchorSwitchId = forcedHint.DeviceId;
-                plan.AnchorCustomerBaseScore = forcedHint.CustomerBaseScore + 1000f;
-            }
-            else
-            {
-                SwitchTrafficProfile best = plan.SwitchProfiles.Values
-                    .Where(p => p != null && IsCoreSwitchId(p.DeviceId))
-                    .OrderByDescending(p => p.CustomerBaseScore)
+                best = plan.SwitchProfiles.Values
+                    .Where(p => p != null)
+                    .OrderBy(p => IsLowTierSwitchId(p.DeviceId) ? 1 : 0)
+                    .ThenByDescending(p => p.CustomerBaseScore)
                     .ThenByDescending(p => p.IngressScore)
-                    .ThenByDescending(p => p.ExternalServerEdgeCount)
-                    .ThenByDescending(p => p.ExternalUnknownEdgeCount)
-                    .ThenByDescending(p => p.DomainExitEdgeCount)
                     .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
                     .FirstOrDefault();
-
-                if (best == null)
-                {
-                    best = plan.SwitchProfiles.Values
-                        .Where(p => p != null)
-                        .OrderBy(p => IsLowTierSwitchId(p.DeviceId) ? 1 : 0)
-                        .ThenByDescending(p => p.CustomerBaseScore)
-                        .ThenByDescending(p => p.IngressScore)
-                        .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
-                        .FirstOrDefault();
-                }
-
-                plan.IngressAnchorSwitchId = best != null ? best.DeviceId : string.Empty;
-                plan.AnchorCustomerBaseScore = best != null ? best.CustomerBaseScore : 0f;
             }
+
+            plan.IngressAnchorSwitchId = best != null ? best.DeviceId : string.Empty;
+            plan.AnchorCustomerBaseScore = best != null ? best.CustomerBaseScore : 0f;
 
             foreach (SwitchTrafficProfile profile in plan.SwitchProfiles.Values)
                 profile.IsAnchor = string.Equals(profile.DeviceId, plan.IngressAnchorSwitchId, StringComparison.OrdinalIgnoreCase);
@@ -581,15 +567,6 @@ namespace AutoSwitch
 
         private static void ChooseInterFabricUplink(FabricRuntimePlan plan)
         {
-            SwitchTrafficProfile forcedHint = plan.SwitchProfiles.Values
-                .FirstOrDefault(p => EndsWithRuntimeSuffix(p.DeviceId, PreferredInterFabricSuffixHint));
-
-            if (forcedHint != null && forcedHint.InterFabricSameDomainEdgeCount > 0)
-            {
-                plan.PreferredDomainUplinkSwitchId = forcedHint.DeviceId;
-                return;
-            }
-
             SwitchTrafficProfile best = plan.SwitchProfiles.Values
                 .OrderByDescending(p => p.DomainExitEdgeCount)
                 .ThenByDescending(p => p.InterFabricSameDomainEdgeCount)
@@ -768,9 +745,6 @@ namespace AutoSwitch
                 (profile.ExternalServerEdgeCount * 12.0f) +
                 (profile.ExternalUnknownEdgeCount * 9.0f) +
                 (profile.DomainExitEdgeCount * 2.0f);
-
-            if (EndsWithRuntimeSuffix(profile.DeviceId, PreferredIngressSuffixHint))
-                profile.CustomerBaseScore += 250f;
 
             return profile;
         }
@@ -3705,12 +3679,33 @@ namespace AutoSwitch
             "active"
         };
 
+        private static readonly string[] ButtonPowerMethodNameHints =
+        {
+            "Press",
+            "Click",
+            "Interact",
+            "Use",
+            "Activate",
+            "Toggle",
+            "Trigger",
+            "Submit"
+        };
+
         private static int TrySwitchPowerMicroToggle(GameObject root)
         {
             if (root == null)
                 return 0;
 
             int invoked = 0;
+
+            try
+            {
+                invoked += TryInvokeButtonPowerInteraction(root);
+                if (invoked > 0)
+                    return invoked;
+            }
+            catch { }
+
             Component[] components;
             try
             {
@@ -3789,6 +3784,79 @@ namespace AutoSwitch
             return invoked;
         }
 
+
+        private static int TryInvokeButtonPowerInteraction(GameObject root)
+        {
+            if (root == null)
+                return 0;
+
+            int invoked = 0;
+            Transform[] transforms;
+            try
+            {
+                transforms = root.GetComponentsInChildren<Transform>(true);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (transforms == null)
+                return 0;
+
+            foreach (Transform transform in transforms)
+            {
+                if (transform == null || transform.gameObject == null)
+                    continue;
+
+                string name = transform.gameObject.name ?? string.Empty;
+                if (name.IndexOf("Buttonpower_", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    name.IndexOf("ButtonPower_", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                try
+                {
+                    var uiButton = transform.gameObject.GetComponent<UnityEngine.UI.Button>();
+                    if (uiButton != null)
+                    {
+                        uiButton.onClick?.Invoke();
+                        invoked++;
+                        return invoked;
+                    }
+                }
+                catch { }
+
+                Component[] buttonComponents;
+                try
+                {
+                    buttonComponents = transform.gameObject.GetComponents<Component>();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (buttonComponents == null)
+                    continue;
+
+                foreach (Component component in buttonComponents)
+                {
+                    if (component == null)
+                        continue;
+
+                    foreach (string methodName in ButtonPowerMethodNameHints)
+                    {
+                        if (TryInvokeCachedWakeMethod(component, methodName) > 0)
+                        {
+                            invoked++;
+                            return invoked;
+                        }
+                    }
+                }
+            }
+
+            return invoked;
+        }
 
         private static readonly Dictionary<string, MethodInfo> CachedWakeBooleanMethods = new Dictionary<string, MethodInfo>();
 
