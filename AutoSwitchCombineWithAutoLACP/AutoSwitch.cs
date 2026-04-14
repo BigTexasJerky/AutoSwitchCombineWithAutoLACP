@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.12a", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.13", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.12a active. Reload wake retry pulse with quiet server refresh and public-release cleanup.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.12a active. Reload wake with network dirty pulse and quiet reflection cleanup.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3137,6 +3137,8 @@ namespace AutoSwitch
         private static bool _hasAppliedAtLeastOnce;
         private static bool _serverWakeQueued;
         private static float _lastServerWakeRealtime;
+        private static readonly Dictionary<string, System.Reflection.MethodInfo> CachedWakeMethods =
+            new Dictionary<string, System.Reflection.MethodInfo>(StringComparer.OrdinalIgnoreCase);
 
         private const float InitialDelaySeconds = 8.0f;
         private const float MinDelaySeconds = 0.35f;
@@ -3166,6 +3168,7 @@ namespace AutoSwitch
             _hasAppliedAtLeastOnce = false;
             _serverWakeQueued = false;
             _lastServerWakeRealtime = 0f;
+            CachedWakeMethods.Clear();
 
             lock (_stateLock)
             {
@@ -3438,7 +3441,7 @@ namespace AutoSwitch
 
         private static IEnumerator RunServerWakePulse(string reason)
         {
-            const int maxAttempts = 8;
+            const int maxAttempts = 10;
             const float retryDelaySeconds = 0.75f;
 
             yield return new WaitForSeconds(0.60f);
@@ -3451,9 +3454,12 @@ namespace AutoSwitch
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 Dictionary<int, GameObject> serverRoots = new Dictionary<int, GameObject>();
+                Dictionary<int, GameObject> networkRoots = new Dictionary<int, GameObject>();
                 int touched = 0;
                 int behaviourToggles = 0;
                 int objectPulses = 0;
+                int networkCalls = 0;
+                int cablePulses = 0;
 
                 try
                 {
@@ -3467,73 +3473,119 @@ namespace AutoSwitch
                             continue;
 
                         string typeName = type.FullName ?? type.Name ?? string.Empty;
-                        if (typeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0)
-                            continue;
-
                         GameObject go = component.gameObject;
-                        if (go == null)
-                            continue;
-
                         int id = go.GetInstanceID();
-                        if (!serverRoots.ContainsKey(id))
-                            serverRoots[id] = go;
+
+                        if (typeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            if (!serverRoots.ContainsKey(id))
+                                serverRoots[id] = go;
+                        }
+
+                        if (typeName.IndexOf("Cable", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            typeName.IndexOf("Port", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            typeName.IndexOf("Socket", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            typeName.IndexOf("Network", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            typeName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            if (!networkRoots.ContainsKey(id))
+                                networkRoots[id] = go;
+                        }
                     }
 
-                    if (serverRoots.Count > 0)
+                    bool hasTargets = serverRoots.Count > 0 || networkRoots.Count > 0 || NetworkMap.instance != null;
+                    if (hasTargets)
                     {
                         _lastServerWakeRealtime = Time.realtimeSinceStartup;
 
-                        foreach (GameObject serverRoot in serverRoots.Values)
+                        foreach (GameObject root in serverRoots.Values)
                         {
-                            if (serverRoot == null)
+                            if (root == null)
                                 continue;
 
                             touched++;
 
                             try
                             {
-                                if (serverRoot.activeSelf)
+                                if (root.activeSelf)
                                 {
-                                    serverRoot.SetActive(false);
-                                    serverRoot.SetActive(true);
+                                    root.SetActive(false);
+                                    root.SetActive(true);
                                 }
                                 else
                                 {
-                                    serverRoot.SetActive(true);
+                                    root.SetActive(true);
                                 }
 
                                 objectPulses++;
                             }
                             catch { }
-
-                            foreach (Behaviour behaviour in serverRoot.GetComponentsInChildren<Behaviour>(true))
-                            {
-                                if (behaviour == null)
-                                    continue;
-
-                                string behaviourTypeName = behaviour.GetType().FullName ?? behaviour.GetType().Name ?? string.Empty;
-                                if (behaviourTypeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                    behaviourTypeName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                    behaviourTypeName.IndexOf("Network", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                    behaviourTypeName.IndexOf("Status", StringComparison.OrdinalIgnoreCase) < 0)
-                                    continue;
-
-                                try
-                                {
-                                    bool original = behaviour.enabled;
-                                    behaviour.enabled = !original;
-                                    behaviour.enabled = original;
-                                    behaviourToggles++;
-                                }
-                                catch { }
-                            }
                         }
+
+                        foreach (GameObject root in networkRoots.Values)
+                        {
+                            if (root == null)
+                                continue;
+
+                            string rootName = root.name ?? string.Empty;
+                            if (rootName.IndexOf("Cable", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                rootName.IndexOf("Port", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                rootName.IndexOf("Socket", StringComparison.OrdinalIgnoreCase) < 0)
+                                continue;
+
+                            try
+                            {
+                                if (root.activeSelf)
+                                {
+                                    root.SetActive(false);
+                                    root.SetActive(true);
+                                }
+                                else
+                                {
+                                    root.SetActive(true);
+                                }
+                                cablePulses++;
+                            }
+                            catch { }
+                        }
+
+                        foreach (Behaviour behaviour in UnityEngine.Object.FindObjectsOfType<Behaviour>(true))
+                        {
+                            if (behaviour == null)
+                                continue;
+
+                            Type behaviourType = behaviour.GetType();
+                            if (behaviourType == null)
+                                continue;
+
+                            string behaviourTypeName = behaviourType.FullName ?? behaviourType.Name ?? string.Empty;
+                            if (behaviourTypeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                behaviourTypeName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                behaviourTypeName.IndexOf("Network", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                behaviourTypeName.IndexOf("Status", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                behaviourTypeName.IndexOf("Cable", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                behaviourTypeName.IndexOf("Port", StringComparison.OrdinalIgnoreCase) < 0)
+                                continue;
+
+                            try
+                            {
+                                bool original = behaviour.enabled;
+                                behaviour.enabled = !original;
+                                behaviour.enabled = original;
+                                behaviourToggles++;
+                            }
+                            catch { }
+                        }
+
+                        networkCalls += InvokeNetworkWakeCandidates(NetworkMap.instance);
 
                         AutoSwitchMod.LogToFile(
                             "SERVER WAKE | reason=" + reason +
                             " | touched=" + touched.ToString(CultureInfo.InvariantCulture) +
                             " | behaviourToggles=" + behaviourToggles.ToString(CultureInfo.InvariantCulture) +
                             " | objectPulses=" + objectPulses.ToString(CultureInfo.InvariantCulture) +
+                            " | cablePulses=" + cablePulses.ToString(CultureInfo.InvariantCulture) +
+                            " | networkCalls=" + networkCalls.ToString(CultureInfo.InvariantCulture) +
                             " | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                         yield break;
                     }
@@ -3555,8 +3607,54 @@ namespace AutoSwitch
 
                 AutoSwitchMod.LogToFile(
                     "SERVER WAKE | reason=" + reason +
-                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
+                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | cablePulses=0 | networkCalls=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                 yield break;
+            }
+        }
+
+        private static int InvokeNetworkWakeCandidates(NetworkMap networkMap)
+        {
+            if (networkMap == null)
+                return 0;
+
+            int invoked = 0;
+
+            invoked += TryInvokeCachedWakeMethod(networkMap, "RegisterAllCables");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "Refresh");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "RefreshAll");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "UpdateConnections");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "RebuildRoutes");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "RecalculateRoutes");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "RebuildNetwork");
+            invoked += TryInvokeCachedWakeMethod(networkMap, "UpdateNetwork");
+
+            return invoked;
+        }
+
+        private static int TryInvokeCachedWakeMethod(object target, string methodName)
+        {
+            if (target == null || string.IsNullOrWhiteSpace(methodName))
+                return 0;
+
+            string cacheKey = target.GetType().FullName + "::" + methodName;
+            System.Reflection.MethodInfo method;
+            if (!CachedWakeMethods.TryGetValue(cacheKey, out method))
+            {
+                method = AccessTools.Method(target.GetType(), methodName, Type.EmptyTypes);
+                CachedWakeMethods[cacheKey] = method;
+            }
+
+            if (method == null)
+                return 0;
+
+            try
+            {
+                method.Invoke(target, null);
+                return 1;
+            }
+            catch
+            {
+                return 0;
             }
         }
 
