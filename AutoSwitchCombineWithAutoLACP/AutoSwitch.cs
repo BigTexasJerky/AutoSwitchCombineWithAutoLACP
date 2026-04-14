@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.16", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.17", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.16 active. Cross-fabric managed-switch bundle suppression with conservative wake retries.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.17 active. Cross-fabric managed-switch bundle suppression with switch power-state micro-toggle wake.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3511,6 +3511,7 @@ namespace AutoSwitch
                 int cablePulses = 0;
                 int networkCalls = 0;
                 int switchMethodCalls = 0;
+                int powerToggleCalls = 0;
 
                 try
                 {
@@ -3567,6 +3568,14 @@ namespace AutoSwitch
                             catch { }
                         }
 
+                        try
+                        {
+                            GameObject sacrificial = ChooseSacrificialSwitchRoot(switchRoots.Values);
+                            if (sacrificial != null)
+                                powerToggleCalls += TrySwitchPowerMicroToggle(sacrificial);
+                        }
+                        catch { }
+
                         foreach (Behaviour behaviour in UnityEngine.Object.FindObjectsOfType<Behaviour>(true))
                         {
                             if (behaviour == null)
@@ -3599,6 +3608,7 @@ namespace AutoSwitch
                             " | cablePulses=" + cablePulses.ToString(CultureInfo.InvariantCulture) +
                             " | networkCalls=" + networkCalls.ToString(CultureInfo.InvariantCulture) +
                             " | switchMethodCalls=" + switchMethodCalls.ToString(CultureInfo.InvariantCulture) +
+                            " | powerToggleCalls=" + powerToggleCalls.ToString(CultureInfo.InvariantCulture) +
                             " | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                         yield break;
                     }
@@ -3620,7 +3630,7 @@ namespace AutoSwitch
 
                 AutoSwitchMod.LogToFile(
                     "SWITCH WAKE | reason=" + reason +
-                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | cablePulses=0 | networkCalls=0 | switchMethodCalls=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
+                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | cablePulses=0 | networkCalls=0 | switchMethodCalls=0 | powerToggleCalls=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                 yield break;
             }
         }
@@ -3628,6 +3638,108 @@ namespace AutoSwitch
         private static int InvokeNetworkWakeCandidates(NetworkMap networkMap)
         {
             return 0;
+        }
+
+        private static GameObject ChooseSacrificialSwitchRoot(IEnumerable<GameObject> roots)
+        {
+            if (roots == null)
+                return null;
+
+            foreach (GameObject root in roots)
+            {
+                if (root == null)
+                    continue;
+
+                string name = root.name ?? string.Empty;
+                if (name.IndexOf("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return root;
+            }
+
+            return roots.FirstOrDefault(r => r != null);
+        }
+
+        private static readonly string[] SwitchPowerOffMethodNameHints =
+        {
+            "TurnOff",
+            "PowerOff",
+            "SetPowerOff",
+            "DisablePower",
+            "Shutdown",
+            "SwitchOff"
+        };
+
+        private static readonly string[] SwitchPowerOnMethodNameHints =
+        {
+            "TurnOn",
+            "PowerOn",
+            "SetPowerOn",
+            "EnablePower",
+            "BootUp",
+            "SwitchOn"
+        };
+
+        private static int TrySwitchPowerMicroToggle(GameObject root)
+        {
+            if (root == null)
+                return 0;
+
+            int invoked = 0;
+            Component[] components;
+            try
+            {
+                components = root.GetComponentsInChildren<Component>(true);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (components == null)
+                return 0;
+
+            foreach (Component component in components)
+            {
+                if (component == null)
+                    continue;
+
+                Type type = component.GetType();
+                if (type == null)
+                    continue;
+
+                string typeName = type.FullName ?? type.Name ?? string.Empty;
+                string gameObjectName = component.gameObject != null ? (component.gameObject.name ?? string.Empty) : string.Empty;
+                if (typeName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    gameObjectName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                bool didOff = false;
+                foreach (string methodName in SwitchPowerOffMethodNameHints)
+                {
+                    if (TryInvokeCachedWakeMethod(component, methodName) > 0)
+                    {
+                        invoked++;
+                        didOff = true;
+                        break;
+                    }
+                }
+
+                if (!didOff)
+                    continue;
+
+                foreach (string methodName in SwitchPowerOnMethodNameHints)
+                {
+                    if (TryInvokeCachedWakeMethod(component, methodName) > 0)
+                    {
+                        invoked++;
+                        return invoked;
+                    }
+                }
+            }
+
+            return invoked;
         }
 
         private static readonly string[] SwitchWakeMethodNameHints =
