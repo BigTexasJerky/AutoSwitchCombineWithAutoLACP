@@ -1187,6 +1187,47 @@ namespace AutoSwitch
 
                     foreach (Tuple<string, string, string> edge in desiredEdges)
                         EnsureVirtualConnection(networkMap, edge.Item1, edge.Item2, plan.FabricId, plan.DomainId, edge.Item3);
+
+                    foreach (SyntheticShareLink shareLink in plan.SyntheticInternalShareLinks)
+                    {
+                        EnsureVirtualConnection(
+                            networkMap,
+                            shareLink.FromSwitchId,
+                            shareLink.ToSwitchId,
+                            plan.FabricId,
+                            plan.DomainId,
+                            "synthetic-share-" + (shareLink.Reason ?? "anchor-share"));
+                    }
+                }
+
+                foreach (FabricRuntimePlan plan in plans.OrderBy(p => p.FabricId, StringComparer.OrdinalIgnoreCase))
+                {
+                    foreach (DomainPropagationIntent intent in plan.DomainPropagationIntents)
+                    {
+                        string fromSwitch = intent.FromSwitchId;
+                        string toSwitch = intent.ToSwitchId;
+
+                        if (string.IsNullOrWhiteSpace(fromSwitch))
+                            fromSwitch = !string.IsNullOrWhiteSpace(plan.PreferredDomainUplinkSwitchId)
+                                ? plan.PreferredDomainUplinkSwitchId
+                                : plan.IngressAnchorSwitchId;
+
+                        FabricRuntimePlan targetPlan = plans.FirstOrDefault(p =>
+                            string.Equals(p.FabricId, intent.ToFabricId, StringComparison.OrdinalIgnoreCase));
+
+                        if (string.IsNullOrWhiteSpace(toSwitch) && targetPlan != null)
+                            toSwitch = !string.IsNullOrWhiteSpace(targetPlan.IngressAnchorSwitchId)
+                                ? targetPlan.IngressAnchorSwitchId
+                                : targetPlan.PreferredDomainUplinkSwitchId;
+
+                        EnsureVirtualConnection(
+                            networkMap,
+                            fromSwitch,
+                            toSwitch,
+                            plan.FabricId,
+                            plan.DomainId,
+                            "domain-propagation-" + (intent.IntentKind ?? "inter-fabric"));
+                    }
                 }
             }
             catch (Exception ex)
