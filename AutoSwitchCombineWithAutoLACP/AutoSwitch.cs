@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.17", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.18", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.17 active. Cross-fabric managed-switch bundle suppression with switch power-state micro-toggle wake.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.18 active. Cross-fabric managed-switch bundle suppression with generic switch power-state field/property wake for public release.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3680,6 +3680,31 @@ namespace AutoSwitch
             "SwitchOn"
         };
 
+        private static readonly string[] SwitchPowerToggleMethodNameHints =
+        {
+            "SetPower",
+            "SetPowered",
+            "SetIsPowered",
+            "SetPowerState",
+            "SetSwitchOn",
+            "SetOn",
+            "SetEnabled",
+            "SetActive",
+            "TogglePower"
+        };
+
+        private static readonly string[] SwitchPowerStateMemberNameHints =
+        {
+            "isPowered",
+            "powered",
+            "powerOn",
+            "isOn",
+            "switchOn",
+            "turnedOn",
+            "enabled",
+            "active"
+        };
+
         private static int TrySwitchPowerMicroToggle(GameObject root)
         {
             if (root == null)
@@ -3726,14 +3751,36 @@ namespace AutoSwitch
                     }
                 }
 
-                if (!didOff)
-                    continue;
-
-                foreach (string methodName in SwitchPowerOnMethodNameHints)
+                if (didOff)
                 {
-                    if (TryInvokeCachedWakeMethod(component, methodName) > 0)
+                    foreach (string methodName in SwitchPowerOnMethodNameHints)
+                    {
+                        if (TryInvokeCachedWakeMethod(component, methodName) > 0)
+                        {
+                            invoked++;
+                            return invoked;
+                        }
+                    }
+                }
+
+                foreach (string methodName in SwitchPowerToggleMethodNameHints)
+                {
+                    if (TryInvokeCachedWakeBooleanMethod(component, methodName, false) > 0)
                     {
                         invoked++;
+                        if (TryInvokeCachedWakeBooleanMethod(component, methodName, true) > 0)
+                        {
+                            invoked++;
+                            return invoked;
+                        }
+                    }
+                }
+
+                foreach (string memberName in SwitchPowerStateMemberNameHints)
+                {
+                    if (TryToggleBooleanLikeMember(component, memberName))
+                    {
+                        invoked += 2;
                         return invoked;
                     }
                 }
@@ -3742,6 +3789,106 @@ namespace AutoSwitch
             return invoked;
         }
 
+
+        private static readonly Dictionary<string, MethodInfo> CachedWakeBooleanMethods = new Dictionary<string, MethodInfo>();
+
+        private static int TryInvokeCachedWakeBooleanMethod(Component component, string methodName, bool state)
+        {
+            if (component == null || string.IsNullOrWhiteSpace(methodName))
+                return 0;
+
+            Type type = component.GetType();
+            if (type == null)
+                return 0;
+
+            string cacheKey = type.FullName + "::" + methodName + "(bool)";
+            if (!CachedWakeBooleanMethods.TryGetValue(cacheKey, out MethodInfo method))
+            {
+                method = type.GetMethod(methodName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(bool) }, null);
+                if (method == null)
+                {
+                    method = type.GetMethod(methodName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(Boolean) }, null);
+                }
+                CachedWakeBooleanMethods[cacheKey] = method;
+            }
+
+            if (method == null)
+                return 0;
+
+            try
+            {
+                method.Invoke(component, new object[] { state });
+                return 1;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static bool TryToggleBooleanLikeMember(Component component, string memberName)
+        {
+            if (component == null || string.IsNullOrWhiteSpace(memberName))
+                return false;
+
+            Type type = component.GetType();
+            if (type == null)
+                return false;
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            try
+            {
+                PropertyInfo prop = type.GetProperty(memberName, flags);
+                if (prop != null && prop.CanRead && prop.CanWrite)
+                {
+                    Type pt = prop.PropertyType;
+                    if (pt == typeof(bool) || pt == typeof(Boolean))
+                    {
+                        bool original = (bool)prop.GetValue(component, null);
+                        prop.SetValue(component, !original, null);
+                        prop.SetValue(component, original, null);
+                        return true;
+                    }
+                    if (pt == typeof(int) || pt == typeof(Int32))
+                    {
+                        int original = (int)prop.GetValue(component, null);
+                        int alt = original == 0 ? 1 : 0;
+                        prop.SetValue(component, alt, null);
+                        prop.SetValue(component, original, null);
+                        return true;
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                FieldInfo field = type.GetField(memberName, flags);
+                if (field != null)
+                {
+                    Type ft = field.FieldType;
+                    if (ft == typeof(bool) || ft == typeof(Boolean))
+                    {
+                        bool original = (bool)field.GetValue(component);
+                        field.SetValue(component, !original);
+                        field.SetValue(component, original);
+                        return true;
+                    }
+                    if (ft == typeof(int) || ft == typeof(Int32))
+                    {
+                        int original = (int)field.GetValue(component);
+                        int alt = original == 0 ? 1 : 0;
+                        field.SetValue(component, alt);
+                        field.SetValue(component, original);
+                        return true;
+                    }
+                }
+            }
+            catch { }
+
+            return false;
+        }
         private static readonly string[] SwitchWakeMethodNameHints =
         {
             "CheckConnections",
