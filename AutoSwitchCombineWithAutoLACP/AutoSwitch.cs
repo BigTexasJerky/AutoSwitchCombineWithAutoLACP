@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.15", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.16", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.15 active. Switch-side recompute wake targeting switch components and cable-end dirty methods.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.16 active. Cross-fabric managed-switch bundle suppression with conservative wake retries.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -298,6 +298,30 @@ namespace AutoSwitch
                             fanoutCandidateCableIds.Add(cableId);
 
                         LogFanoutCandidate(plan, accumulator);
+                    }
+
+                    if (accumulator.IsManagedRemote)
+                    {
+                        string managedSkipSignature =
+                            plan.FabricId + "|" +
+                            plan.DomainId + "|" +
+                            accumulator.RemoteDeviceId + "|" +
+                            string.Join(",", distinctIds.OrderBy(x => x));
+
+                        if (LoggedBundleSignatures.Add("SKIP|" + managedSkipSignature))
+                        {
+                            LogToFile(
+                                "SAFE NATIVE BUNDLE SKIPPED | fabricId=" + plan.FabricId +
+                                " | domainId=" + plan.DomainId +
+                                " | remote=" + accumulator.RemoteDeviceId +
+                                " | reason=managed-remote-cross-fabric" +
+                                " | localMembers=[" + string.Join(",", accumulator.LocalBuckets.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                                " | cableCount=" + distinctIds.Count.ToString(CultureInfo.InvariantCulture) +
+                                " | cableIds=[" + string.Join(",", distinctIds.OrderBy(x => x)) + "]"
+                            );
+                        }
+
+                        continue;
                     }
 
                     BundleBuilder bundle = new BundleBuilder();
@@ -3139,6 +3163,7 @@ namespace AutoSwitch
         private static float _lastServerWakeRealtime;
         private static readonly Dictionary<string, System.Reflection.MethodInfo> CachedWakeMethods =
             new Dictionary<string, System.Reflection.MethodInfo>(StringComparer.OrdinalIgnoreCase);
+        private static string _lastFollowupRegroupSignature = string.Empty;
 
         private const float InitialDelaySeconds = 8.0f;
         private const float MinDelaySeconds = 0.35f;
@@ -3169,6 +3194,7 @@ namespace AutoSwitch
             _serverWakeQueued = false;
             _lastServerWakeRealtime = 0f;
             CachedWakeMethods.Clear();
+            _lastFollowupRegroupSignature = string.Empty;
 
             lock (_stateLock)
             {
@@ -3183,6 +3209,30 @@ namespace AutoSwitch
         {
             QueueSwitchWakePulse("scene bootstrap");
         }
+
+        private static void QueueFollowupRegroupIfNeeded()
+        {
+            string signature = _lastAppliedSignature ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(signature))
+                return;
+
+            if (string.Equals(_lastFollowupRegroupSignature, signature, StringComparison.Ordinal))
+                return;
+
+            _lastFollowupRegroupSignature = signature;
+            MelonCoroutines.Start(RunFollowupRegroup(signature));
+        }
+
+        private static IEnumerator RunFollowupRegroup(string signature)
+        {
+            yield return new WaitForSeconds(2.25f);
+
+            if (!string.Equals(_lastAppliedSignature ?? string.Empty, signature, StringComparison.Ordinal))
+                yield break;
+
+            QueueRegroup("followup confirm");
+        }
+
 
         internal static HashSet<int> GetOwnedGroupIdsSnapshot()
         {
@@ -3261,6 +3311,7 @@ namespace AutoSwitch
             {
                 RebuildAutoLacpGroups();
                 QueueSwitchWakePulse("lacp regroup");
+                QueueFollowupRegroupIfNeeded();
                 _hasAppliedAtLeastOnce = true;
             }
             catch (Exception ex)
