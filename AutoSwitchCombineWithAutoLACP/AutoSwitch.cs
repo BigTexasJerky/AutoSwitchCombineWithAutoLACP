@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.7", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -56,6 +56,12 @@ namespace AutoSwitch
 
         internal static readonly Dictionary<int, RegisteredCableInfo> RegisteredCables =
             new Dictionary<int, RegisteredCableInfo>();
+
+        private static readonly HashSet<int> SyntheticRegisteredCableIds =
+            new HashSet<int>();
+
+        private static readonly HashSet<string> LoggedSyntheticRegistrationSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly Dictionary<string, float> FabricIdToSpeed =
             new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
@@ -100,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.0 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.7 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.0 active. Route-graph fabric patch mode.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.7 active. Fabric-controller cable-backed spine mode plus dormant-member feeds.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -120,6 +126,14 @@ namespace AutoSwitch
             RegisteredCables.Clear();
             FabricIdToSpeed.Clear();
             FabricIdToBundleCableIds.Clear();
+            InjectedVirtualEdgeSignatures.Clear();
+            VirtualEdgeSignatureToCableId.Clear();
+            LoggedGraphTypeSignatures.Clear();
+            LoggedFabricControllerSignatures.Clear();
+            LoggedCableTupleTypes.Clear();
+            LoggedSyntheticRegistrationSignatures.Clear();
+            SyntheticRegisteredCableIds.Clear();
+            NextVirtualCableId = -2000000;
             FabricIdToMemberIdsSnapshot.Clear();
             SwitchIdToFabricIdSnapshot.Clear();
 
@@ -210,6 +224,14 @@ namespace AutoSwitch
 
             FabricIdToSpeed.Clear();
             FabricIdToBundleCableIds.Clear();
+            InjectedVirtualEdgeSignatures.Clear();
+            VirtualEdgeSignatureToCableId.Clear();
+            LoggedGraphTypeSignatures.Clear();
+            LoggedFabricControllerSignatures.Clear();
+            LoggedCableTupleTypes.Clear();
+            LoggedSyntheticRegistrationSignatures.Clear();
+            SyntheticRegisteredCableIds.Clear();
+            NextVirtualCableId = -2000000;
 
             Dictionary<string, HashSet<string>> fabricAdjacency =
                 BuildFabricAdjacency(deviceIdToFabricId, externalLacpCableIds);
@@ -225,6 +247,12 @@ namespace AutoSwitch
                 externalLacpCableIds);
 
             ApplyFabricTags(fabricPlans);
+            ApplyVirtualFabricEdgesToNetworkMap(fabricPlans);
+            RehydrateFabricPlansFromRegisteredCables(
+                fabricPlans,
+                deviceIdToFabricId,
+                fabricToDomain,
+                externalLacpCableIds);
 
             List<BundleBuilder> allBundles = new List<BundleBuilder>();
 
@@ -1026,7 +1054,6 @@ namespace AutoSwitch
                 {
                     PatchIfFound(networkMapType, "RegisterSwitch", nameof(NetworkMap_RegisterSwitch_Postfix));
                     PatchIfFound(networkMapType, "RegisterCableConnection", nameof(NetworkMap_RegisterCableConnection_Postfix));
-                    PatchIfFound(networkMapType, "FindAllRoutes", nameof(NetworkMap_FindAllRoutes_Postfix));
                 }
             }
             catch (Exception ex)
@@ -1126,51 +1153,810 @@ namespace AutoSwitch
         }
 
 
-        private static void NetworkMap_FindAllRoutes_Postfix(
-            object __instance,
-            string __0,
-            string __1,
-            ref List<List<string>> __result)
+        private static readonly HashSet<string> InjectedVirtualEdgeSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<string, int> VirtualEdgeSignatureToCableId =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedGraphTypeSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedFabricControllerSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedCableTupleTypes =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static int NextVirtualCableId = -2000000;
+
+        private static void ApplyVirtualFabricEdgesToNetworkMap(List<FabricRuntimePlan> plans)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(__0) || string.IsNullOrWhiteSpace(__1))
+                NetworkMap networkMap = NetworkMap.instance;
+                if (networkMap == null || plans == null)
                     return;
 
-                Dictionary<string, HashSet<string>> graph = BuildAugmentedGraph(__instance);
-                if (graph.Count == 0)
-                    return;
+                LogGraphRuntimeTypes(networkMap);
 
-                List<string> route = FindAugmentedShortestPath(graph, __0, __1);
-                if (route == null || route.Count < 2)
-                    return;
-
-                if (__result == null)
-                    __result = new List<List<string>>();
-
-                string newSignature = string.Join(">", route);
-                foreach (List<string> existing in __result)
+                foreach (FabricRuntimePlan plan in plans.OrderBy(p => p.FabricId, StringComparer.OrdinalIgnoreCase))
                 {
-                    if (existing == null)
+                    RegisterFabricController(plan);
+                    List<Tuple<string, string, string>> desiredEdges = BuildFabricSpineEdges(plan);
+
+                    foreach (Tuple<string, string, string> edge in desiredEdges)
+                        EnsureVirtualConnection(networkMap, edge.Item1, edge.Item2, plan.FabricId, plan.DomainId, edge.Item3);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile("ApplyVirtualFabricEdgesToNetworkMap failed: " + ex);
+            }
+        }
+
+        private static List<Tuple<string, string, string>> BuildFabricSpineEdges(FabricRuntimePlan plan)
+        {
+            List<Tuple<string, string, string>> result = new List<Tuple<string, string, string>>();
+            if (plan == null || plan.MemberIds.Count == 0)
+                return result;
+
+            string anchor = plan.IngressAnchorSwitchId ?? string.Empty;
+            string uplink = plan.PreferredDomainUplinkSwitchId ?? string.Empty;
+
+            List<string> members = plan.MemberIds
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void AddEdge(string a, string b, string reason)
+            {
+                if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b))
+                    return;
+
+                if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                string key = string.Compare(a, b, StringComparison.OrdinalIgnoreCase) < 0
+                    ? a + "|" + b
+                    : b + "|" + a;
+
+                if (seen.Add(key))
+                    result.Add(Tuple.Create(a, b, reason));
+            }
+
+            List<SwitchTrafficProfile> profiles = plan.SwitchProfiles.Values
+                .Where(p => p != null && !string.IsNullOrWhiteSpace(p.DeviceId))
+                .Where(p => p.DeviceId.StartsWith("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) ||
+                            p.DeviceId.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(p => p.ExternalUnknownEdgeCount + p.ExternalServerEdgeCount)
+                .ThenByDescending(p => p.IngressScore)
+                .ThenByDescending(p => p.InterFabricSameDomainEdgeCount)
+                .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            List<string> hotLeaves = profiles
+                .Where(p => !string.Equals(p.DeviceId, anchor, StringComparison.OrdinalIgnoreCase))
+                .Where(p => p.ExternalUnknownEdgeCount > 0 || p.ExternalServerEdgeCount > 0)
+                .Select(p => p.DeviceId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(4)
+                .ToList();
+
+            // Anchor to uplink is the main trunk.
+            if (!string.IsNullOrWhiteSpace(anchor) &&
+                !string.IsNullOrWhiteSpace(uplink) &&
+                !string.Equals(anchor, uplink, StringComparison.OrdinalIgnoreCase))
+            {
+                AddEdge(anchor, uplink, "anchor-uplink");
+            }
+
+            // Anchor to hot leaves with real external edges.
+            foreach (string member in hotLeaves)
+                AddEdge(anchor, member, "anchor-hotleaf");
+
+            // Uplink to hot leaves helps handoff into the neighboring fabric.
+            if (!string.IsNullOrWhiteSpace(uplink))
+            {
+                foreach (string member in hotLeaves)
+                {
+                    if (!string.Equals(member, uplink, StringComparison.OrdinalIgnoreCase))
+                        AddEdge(uplink, member, "uplink-hotleaf");
+                }
+            }
+
+            // Add one nearest-neighbor chain in sorted order to mimic a physical stack spine.
+            List<string> qsfpBackbone = members
+                .Where(id =>
+                    id.StartsWith("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) ||
+                    id.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            for (int i = 0; i < qsfpBackbone.Count - 1; i++)
+                AddEdge(qsfpBackbone[i], qsfpBackbone[i + 1], "stack-neighbor");
+
+            // Anything still floating without a usable internal path gets a direct anchor feed.
+            // This is especially important for 16CU / 4xSFP members that sit inside the fabric stack
+            // but would otherwise never get any synthetic cable touches or ingress weight.
+            HashSet<string> alreadyConnected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Tuple<string, string, string> edge in result)
+            {
+                alreadyConnected.Add(edge.Item1);
+                alreadyConnected.Add(edge.Item2);
+            }
+
+            List<string> dormantMembers = members
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Where(id => !string.Equals(id, anchor, StringComparison.OrdinalIgnoreCase))
+                .Where(id => !alreadyConnected.Contains(id))
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (string dormant in dormantMembers)
+                AddEdge(anchor, dormant, "anchor-dormant");
+
+            // Also give low-visibility members a direct feed even if they only touch one weak synthetic link.
+            foreach (SwitchTrafficProfile profile in plan.SwitchProfiles.Values
+                .Where(p => p != null && !string.IsNullOrWhiteSpace(p.DeviceId))
+                .Where(p => !string.Equals(p.DeviceId, anchor, StringComparison.OrdinalIgnoreCase))
+                .Where(p => p.InternalFabricEdgeCount <= 1)
+                .Where(p => p.ExternalUnknownEdgeCount == 0)
+                .Where(p => p.ExternalServerEdgeCount == 0)
+                .OrderBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase))
+            {
+                AddEdge(anchor, profile.DeviceId, "anchor-share-weak");
+            }
+
+            // If the anchor somehow had no edges yet, give it a minimal lifeline to the first two members.
+            if (!string.IsNullOrWhiteSpace(anchor) && result.Count == 0)
+            {
+                foreach (string member in members.Where(x => !string.Equals(x, anchor, StringComparison.OrdinalIgnoreCase)).Take(2))
+                    AddEdge(anchor, member, "anchor-minimal");
+            }
+
+            return result;
+        }
+
+        private static void RegisterFabricController(FabricRuntimePlan plan)
+        {
+            if (plan == null)
+                return;
+
+            List<string> hotMembers = plan.SwitchProfiles.Values
+                .Where(p => p != null && !string.IsNullOrWhiteSpace(p.DeviceId))
+                .Where(p => p.DeviceId.StartsWith("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) ||
+                            p.DeviceId.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(p => p.ExternalUnknownEdgeCount + p.ExternalServerEdgeCount)
+                .ThenByDescending(p => p.IngressScore)
+                .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
+                .Select(p => p.DeviceId)
+                .Take(4)
+                .ToList();
+
+            string signature =
+                plan.FabricId + "|" +
+                plan.DomainId + "|" +
+                plan.IngressAnchorSwitchId + "|" +
+                plan.PreferredDomainUplinkSwitchId + "|" +
+                string.Join(",", hotMembers);
+
+            if (LoggedFabricControllerSignatures.Add(signature))
+            {
+                LogToFile(
+                    "FABRIC CONTROLLER | fabricId=" + plan.FabricId +
+                    " | domainId=" + plan.DomainId +
+                    " | anchor=" + plan.IngressAnchorSwitchId +
+                    " | uplink=" + plan.PreferredDomainUplinkSwitchId +
+                    " | hotMembers=[" + string.Join(",", hotMembers) + "]" +
+                    " | memberCount=" + plan.MemberIds.Count.ToString(CultureInfo.InvariantCulture)
+                );
+            }
+        }
+
+
+        private static void RegisterSyntheticCableInfo(
+            int virtualCableId,
+            string a,
+            string b,
+            string fabricId,
+            string domainId,
+            string reason)
+        {
+            try
+            {
+                RegisteredCableInfo info = new RegisteredCableInfo
+                {
+                    CableId = virtualCableId,
+                    DeviceA = a ?? string.Empty,
+                    DeviceB = b ?? string.Empty,
+                    ExtraA = reason ?? string.Empty,
+                    ExtraB = string.Empty,
+                    PortA = -1,
+                    PortB = -1,
+                    EndpointObjectA = null,
+                    EndpointObjectB = null,
+                    ServerRootKeyA = string.Empty,
+                    ServerRootKeyB = string.Empty,
+                    EndpointSwitchIdA = a ?? string.Empty,
+                    EndpointSwitchIdB = b ?? string.Empty
+                };
+
+                RegisteredCables[virtualCableId] = info;
+                SyntheticRegisteredCableIds.Add(virtualCableId);
+
+                string signature =
+                    virtualCableId.ToString(CultureInfo.InvariantCulture) + "|" +
+                    info.DeviceA + "|" + info.DeviceB + "|" +
+                    (fabricId ?? string.Empty) + "|" + (domainId ?? string.Empty);
+
+                if (LoggedSyntheticRegistrationSignatures.Add(signature))
+                {
+                    LogToFile(
+                        "SYNTHETIC CABLE REGISTERED | fabricId=" + (fabricId ?? string.Empty) +
+                        " | domainId=" + (domainId ?? string.Empty) +
+                        " | cableId=" + virtualCableId.ToString(CultureInfo.InvariantCulture) +
+                        " | a=" + info.DeviceA +
+                        " | b=" + info.DeviceB +
+                        " | reason=" + (reason ?? string.Empty));
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile("SYNTHETIC CABLE REGISTER FAILED | cableId=" + virtualCableId.ToString(CultureInfo.InvariantCulture) + " | ex=" + ex.Message);
+            }
+        }
+
+        private static void RehydrateFabricPlansFromRegisteredCables(
+            List<FabricRuntimePlan> existingPlans,
+            Dictionary<string, string> deviceIdToFabricId,
+            Dictionary<string, string> fabricToDomain,
+            HashSet<int> externalLacpCableIds)
+        {
+            if (existingPlans == null)
+                return;
+
+            foreach (FabricRuntimePlan plan in existingPlans)
+            {
+                if (plan == null)
+                    continue;
+
+                plan.SwitchProfiles.Clear();
+
+                foreach (RegisteredSwitchInfo member in plan.Members)
+                {
+                    if (member == null || string.IsNullOrWhiteSpace(member.DeviceName))
                         continue;
 
-                    if (string.Equals(string.Join(">", existing), newSignature, StringComparison.OrdinalIgnoreCase))
-                        return;
+                    SwitchTrafficProfile profile = BuildSwitchTrafficProfile(
+                        member.DeviceName,
+                        plan.FabricId,
+                        deviceIdToFabricId,
+                        fabricToDomain,
+                        externalLacpCableIds);
+
+                    plan.SwitchProfiles[member.DeviceName] = profile;
+
+                    LogToFile(
+                        "REHYDRATED PROFILE | fabricId=" + plan.FabricId +
+                        " | domainId=" + plan.DomainId +
+                        " | device=" + profile.DeviceId +
+                        " | touchedCables=[" + string.Join(",", profile.TouchedCableIds.OrderBy(x => x)) + "]" +
+                        " | internalFabric=" + profile.InternalFabricEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                        " | interFabricSameDomain=" + profile.InterFabricSameDomainEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                        " | unknownEdges=" + profile.ExternalUnknownEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                        " | serverEdges=" + profile.ExternalServerEdgeCount.ToString(CultureInfo.InvariantCulture));
                 }
 
-                __result.Add(route);
+                ChooseFabricAnchor(plan);
+                ChooseInterFabricUplink(plan);
+                BuildSyntheticInternalSharePlan(plan);
+            }
+
+            BuildDomainPropagationPlans(existingPlans);
+        }
+
+        private static void LogGraphRuntimeTypes(NetworkMap networkMap)
+        {
+            try
+            {
+                object rawAdjacency = TryGetMemberValue(networkMap, "adjacencyList");
+                object rawSwitchConnections = TryGetMemberValue(networkMap, "switchConnections");
+                object rawCableConnections = TryGetMemberValue(networkMap, "cableConnections");
+
+                string adjacencyType = rawAdjacency != null ? rawAdjacency.GetType().FullName : "null";
+                string switchConnectionsType = rawSwitchConnections != null ? rawSwitchConnections.GetType().FullName : "null";
+                string cableConnectionsType = rawCableConnections != null ? rawCableConnections.GetType().FullName : "null";
+
+                string signature = adjacencyType + " | " + switchConnectionsType + " | " + cableConnectionsType;
+                if (LoggedGraphTypeSignatures.Add(signature))
+                {
+                    LogToFile(
+                        "GRAPH TYPE | adjacencyList=" + adjacencyType +
+                        " | switchConnections=" + switchConnectionsType +
+                        " | cableConnections=" + cableConnectionsType
+                    );
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile("LogGraphRuntimeTypes failed: " + ex.Message);
+            }
+        }
+
+        private static void EnsureVirtualConnection(
+            NetworkMap networkMap,
+            string a,
+            string b,
+            string fabricId,
+            string domainId,
+            string reason)
+        {
+            if (networkMap == null || string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b))
+                return;
+
+            string signature = string.Compare(a, b, StringComparison.OrdinalIgnoreCase) < 0
+                ? a + "|" + b
+                : b + "|" + a;
+
+            if (InjectedVirtualEdgeSignatures.Contains(signature))
+                return;
+
+            bool hadAdjacencyBefore = HasDirectAdjacency(networkMap, a, b);
+            if (hadAdjacencyBefore)
+            {
+                InjectedVirtualEdgeSignatures.Add(signature);
+                return;
+            }
+
+            bool connectedViaMethod = false;
+            bool adjacencyForced = false;
+            bool switchConnectionsForced = false;
+            bool deviceConnectionsForced = false;
+            bool cableMapForced = false;
+            int virtualCableId = 0;
+
+            try
+            {
+                MethodInfo connectMethod = networkMap.GetType().GetMethod(
+                    "Connect",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    null,
+                    new[] { typeof(string), typeof(string) },
+                    null);
+
+                if (connectMethod != null)
+                {
+                    connectMethod.Invoke(networkMap, new object[] { a, b });
+                    connectedViaMethod = true;
+                }
+
+                adjacencyForced = ForceAdjacencyLink(networkMap, a, b) || hadAdjacencyBefore;
+                switchConnectionsForced = ForceSwitchConnectionsLink(networkMap, a, b);
+                deviceConnectionsForced = ForceDeviceConnectionsLink(networkMap, a, b);
+                cableMapForced = ForceCableConnectionMap(networkMap, a, b, signature, out virtualCableId);
+                if (cableMapForced && virtualCableId != 0)
+                    RegisterSyntheticCableInfo(virtualCableId, a, b, fabricId, domainId, reason);
+
+                InjectedVirtualEdgeSignatures.Add(signature);
 
                 LogToFile(
-                    "VIRTUAL ROUTE | start=" + __0 +
-                    " | target=" + __1 +
-                    " | hops=" + route.Count.ToString(CultureInfo.InvariantCulture) +
-                    " | path=[" + string.Join(" -> ", route) + "]"
+                    "VIRTUAL EDGE | fabricId=" + fabricId +
+                    " | domainId=" + domainId +
+                    " | a=" + a +
+                    " | b=" + b +
+                    " | reason=" + reason +
+                    " | connectMethod=" + connectedViaMethod.ToString().ToLowerInvariant() +
+                    " | adjacency=" + adjacencyForced.ToString().ToLowerInvariant() +
+                    " | switchConnections=" + switchConnectionsForced.ToString().ToLowerInvariant() +
+                    " | deviceConnections=" + deviceConnectionsForced.ToString().ToLowerInvariant() +
+                    " | cableMap=" + cableMapForced.ToString().ToLowerInvariant() +
+                    " | virtualCableId=" + virtualCableId.ToString(CultureInfo.InvariantCulture) +
+                    " | cableBacked=" + cableMapForced.ToString().ToLowerInvariant()
                 );
             }
             catch (Exception ex)
             {
-                LogToFile("NetworkMap_FindAllRoutes_Postfix failed: " + ex);
+                LogToFile(
+                    "VIRTUAL EDGE FAIL | fabricId=" + fabricId +
+                    " | domainId=" + domainId +
+                    " | a=" + a +
+                    " | b=" + b +
+                    " | reason=" + reason +
+                    " | " + ex.Message
+                );
             }
+        }
+
+        private static bool ForceAdjacencyLink(NetworkMap networkMap, string a, string b)
+        {
+            try
+            {
+                object rawAdjacency = TryGetMemberValue(networkMap, "adjacencyList");
+                if (rawAdjacency == null)
+                    return false;
+
+                return ForceDictionaryCollectionLink(rawAdjacency, a, b, "adjacency");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+
+        private static bool ForceSwitchConnectionsLink(NetworkMap networkMap, string a, string b)
+        {
+            try
+            {
+                object rawSwitchConnections = TryGetMemberValue(networkMap, "switchConnections");
+                if (rawSwitchConnections == null)
+                    return false;
+
+                return ForceDictionaryCollectionLink(rawSwitchConnections, a, b, "switchConnections");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+
+        private static bool ForceDeviceConnectionsLink(NetworkMap networkMap, string a, string b)
+        {
+            try
+            {
+                object rawDevices = TryGetMemberValue(networkMap, "devices");
+                if (rawDevices == null)
+                    return false;
+
+                Type dictType = rawDevices.GetType();
+                MethodInfo tryGetValueMethod = dictType.GetMethod("TryGetValue");
+                if (tryGetValueMethod == null)
+                    return false;
+
+                object[] argsA = new object[] { a, null };
+                bool hasA = (bool)tryGetValueMethod.Invoke(rawDevices, argsA);
+                object deviceA = hasA ? argsA[1] : null;
+
+                object[] argsB = new object[] { b, null };
+                bool hasB = (bool)tryGetValueMethod.Invoke(rawDevices, argsB);
+                object deviceB = hasB ? argsB[1] : null;
+
+                if (deviceA == null || deviceB == null)
+                    return false;
+
+                bool changed = false;
+                changed |= ForceSingleDeviceConnection(deviceA, deviceB);
+                changed |= ForceSingleDeviceConnection(deviceB, deviceA);
+                return changed;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool ForceSingleDeviceConnection(object sourceDevice, object targetDevice)
+        {
+            try
+            {
+                object rawConnections = TryGetMemberValue(sourceDevice, "Connections");
+                if (rawConnections == null)
+                    return false;
+
+                MethodInfo addMethod = rawConnections.GetType().GetMethod("Add");
+                MethodInfo containsMethod = rawConnections.GetType().GetMethod("Contains");
+                if (addMethod == null)
+                    return false;
+
+                bool already = false;
+                if (containsMethod != null)
+                    already = (bool)containsMethod.Invoke(rawConnections, new object[] { targetDevice });
+
+                if (!already)
+                {
+                    addMethod.Invoke(rawConnections, new object[] { targetDevice });
+                    return true;
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool ForceCableConnectionMap(NetworkMap networkMap, string a, string b, string signature, out int virtualCableId)
+        {
+            virtualCableId = 0;
+
+            try
+            {
+                object rawCableConnections = TryGetMemberValue(networkMap, "cableConnections");
+                if (rawCableConnections == null)
+                    return false;
+
+                int existingId;
+                if (!VirtualEdgeSignatureToCableId.TryGetValue(signature, out existingId))
+                {
+                    existingId = NextVirtualCableId--;
+                    VirtualEdgeSignatureToCableId[signature] = existingId;
+                }
+
+                virtualCableId = existingId;
+
+                object tupleValue = CreateIl2CppCableTuple(rawCableConnections, a, b);
+                if (tupleValue == null)
+                    return false;
+
+                bool setOk = TryDictionarySet(rawCableConnections, existingId, tupleValue);
+                if (!setOk)
+                    return false;
+
+                object verify;
+                if (TryDictionaryGet(rawCableConnections, existingId, out verify) && verify != null)
+                    return true;
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+
+        private static bool ForceDictionaryCollectionLink(object dictionaryObject, string a, string b, string label)
+        {
+            bool changed = false;
+
+            object collectionA = GetOrCreateDictionaryValueCollection(dictionaryObject, a);
+            if (collectionA != null)
+                changed |= TryCollectionAdd(collectionA, b);
+
+            object collectionB = GetOrCreateDictionaryValueCollection(dictionaryObject, b);
+            if (collectionB != null)
+                changed |= TryCollectionAdd(collectionB, a);
+
+            return changed || CollectionContainsValue(collectionA, b) || CollectionContainsValue(collectionB, a);
+        }
+
+        private static object GetOrCreateDictionaryValueCollection(object dictionaryObject, object key)
+        {
+            object existing;
+            if (TryDictionaryGet(dictionaryObject, key, out existing) && existing != null)
+                return existing;
+
+            Type dictType = dictionaryObject.GetType();
+            Type[] genericArgs = dictType.IsGenericType ? dictType.GetGenericArguments() : Type.EmptyTypes;
+            if (genericArgs.Length < 2)
+                return null;
+
+            Type valueType = genericArgs[1];
+            object created = null;
+
+            try
+            {
+                created = Activator.CreateInstance(valueType);
+            }
+            catch
+            {
+                try
+                {
+                    MethodInfo ctor = valueType.GetMethod(".ctor", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (ctor != null)
+                        created = ctor.Invoke(null, null);
+                }
+                catch { }
+            }
+
+            if (created == null)
+                return null;
+
+            if (TryDictionarySet(dictionaryObject, key, created))
+                return created;
+
+            object afterSet;
+            if (TryDictionaryGet(dictionaryObject, key, out afterSet))
+                return afterSet;
+
+            return null;
+        }
+
+        private static bool TryDictionaryGet(object dictionaryObject, object key, out object value)
+        {
+            value = null;
+            if (dictionaryObject == null)
+                return false;
+
+            try
+            {
+                MethodInfo tryGetValue = dictionaryObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "TryGetValue" && m.GetParameters().Length == 2);
+
+                if (tryGetValue != null)
+                {
+                    object[] args = new object[] { key, null };
+                    bool ok = (bool)tryGetValue.Invoke(dictionaryObject, args);
+                    if (ok)
+                        value = args[1];
+                    return ok;
+                }
+            }
+            catch { }
+
+            try
+            {
+                PropertyInfo indexer = dictionaryObject.GetType().GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(p => p.GetIndexParameters().Length == 1);
+                if (indexer != null)
+                {
+                    value = indexer.GetValue(dictionaryObject, new object[] { key });
+                    return value != null;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static bool TryDictionarySet(object dictionaryObject, object key, object value)
+        {
+            if (dictionaryObject == null)
+                return false;
+
+            try
+            {
+                PropertyInfo indexer = dictionaryObject.GetType().GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(p => p.GetIndexParameters().Length == 1 && p.CanWrite);
+                if (indexer != null)
+                {
+                    indexer.SetValue(dictionaryObject, value, new object[] { key });
+                    return true;
+                }
+            }
+            catch { }
+
+            try
+            {
+                MethodInfo addMethod = dictionaryObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "Add" && m.GetParameters().Length == 2);
+                if (addMethod != null)
+                {
+                    addMethod.Invoke(dictionaryObject, new object[] { key, value });
+                    return true;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static bool TryCollectionAdd(object collectionObject, object value)
+        {
+            if (collectionObject == null)
+                return false;
+
+            if (CollectionContainsValue(collectionObject, value))
+                return false;
+
+            try
+            {
+                MethodInfo addMethod = collectionObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "Add" && m.GetParameters().Length == 1);
+                if (addMethod != null)
+                {
+                    addMethod.Invoke(collectionObject, new object[] { value });
+                    return true;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static bool CollectionContainsValue(object collectionObject, object value)
+        {
+            if (collectionObject == null)
+                return false;
+
+            try
+            {
+                MethodInfo containsMethod = collectionObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "Contains" && m.GetParameters().Length == 1);
+                if (containsMethod != null)
+                    return (bool)containsMethod.Invoke(collectionObject, new object[] { value });
+            }
+            catch { }
+
+            try
+            {
+                System.Collections.IEnumerable enumerable = collectionObject as System.Collections.IEnumerable;
+                if (enumerable != null)
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (item != null && value != null && string.Equals(item.ToString(), value.ToString(), StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+
+        private static object CreateIl2CppCableTuple(object rawCableConnections, string a, string b)
+        {
+            try
+            {
+                Type dictType = rawCableConnections.GetType();
+                Type[] genericArgs = dictType.IsGenericType ? dictType.GetGenericArguments() : Type.EmptyTypes;
+                if (genericArgs.Length < 2)
+                    return null;
+
+                Type valueType = genericArgs[1];
+                string sig = valueType.FullName ?? valueType.Name;
+                if (LoggedCableTupleTypes.Add(sig))
+                    LogToFile("CABLE TUPLE TYPE | " + sig);
+
+                try
+                {
+                    object tuple = Activator.CreateInstance(valueType, new object[] { a, b });
+                    if (tuple != null)
+                        return tuple;
+                }
+                catch { }
+
+                try
+                {
+                    object tuple = Activator.CreateInstance(valueType);
+                    if (tuple == null)
+                        return null;
+
+                    FieldInfo f1 = valueType.GetField("Item1", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    FieldInfo f2 = valueType.GetField("Item2", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                    if (f1 != null) f1.SetValue(tuple, a);
+                    if (f2 != null) f2.SetValue(tuple, b);
+
+                    return tuple;
+                }
+                catch { }
+
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool HasDirectAdjacency(NetworkMap networkMap, string a, string b)
+        {
+            try
+            {
+                object rawAdjacency = TryGetMemberValue(networkMap, "adjacencyList");
+                if (rawAdjacency == null)
+                    return false;
+
+                object neighborsA;
+                if (TryDictionaryGet(rawAdjacency, a, out neighborsA) && CollectionContainsValue(neighborsA, b))
+                    return true;
+
+                object neighborsB;
+                if (TryDictionaryGet(rawAdjacency, b, out neighborsB) && CollectionContainsValue(neighborsB, a))
+                    return true;
+            }
+            catch { }
+
+            return false;
         }
 
         private static Dictionary<string, HashSet<string>> BuildAugmentedGraph(object networkMapInstance)
