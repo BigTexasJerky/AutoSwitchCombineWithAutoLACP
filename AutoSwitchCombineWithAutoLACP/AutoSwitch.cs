@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.14", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.15", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.14 active. Switch-only reload wake with quiet switch recompute pulse.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.15 active. Switch-side recompute wake targeting switch components and cable-end dirty methods.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3181,7 +3181,7 @@ namespace AutoSwitch
 
         internal static void QueueSceneWakePulse()
         {
-            QueueServerWakePulse("scene bootstrap");
+            QueueSwitchWakePulse("scene bootstrap");
         }
 
         internal static HashSet<int> GetOwnedGroupIdsSnapshot()
@@ -3260,7 +3260,7 @@ namespace AutoSwitch
             try
             {
                 RebuildAutoLacpGroups();
-                QueueServerWakePulse("lacp regroup");
+                QueueSwitchWakePulse("lacp regroup");
                 _hasAppliedAtLeastOnce = true;
             }
             catch (Exception ex)
@@ -3430,16 +3430,16 @@ namespace AutoSwitch
             );
         }
 
-        private static void QueueServerWakePulse(string reason)
+        private static void QueueSwitchWakePulse(string reason)
         {
             if (_serverWakeQueued)
                 return;
 
             _serverWakeQueued = true;
-            MelonCoroutines.Start(RunServerWakePulse(reason));
+            MelonCoroutines.Start(RunSwitchWakePulse(reason));
         }
 
-        private static IEnumerator RunServerWakePulse(string reason)
+        private static IEnumerator RunSwitchWakePulse(string reason)
         {
             const int maxAttempts = 10;
             const float retryDelaySeconds = 0.75f;
@@ -3459,6 +3459,7 @@ namespace AutoSwitch
                 int objectPulses = 0;
                 int cablePulses = 0;
                 int networkCalls = 0;
+                int switchMethodCalls = 0;
 
                 try
                 {
@@ -3507,6 +3508,12 @@ namespace AutoSwitch
                                 objectPulses++;
                             }
                             catch { }
+
+                            try
+                            {
+                                switchMethodCalls += InvokeSwitchWakeCandidates(root);
+                            }
+                            catch { }
                         }
 
                         foreach (Behaviour behaviour in UnityEngine.Object.FindObjectsOfType<Behaviour>(true))
@@ -3540,6 +3547,7 @@ namespace AutoSwitch
                             " | objectPulses=" + objectPulses.ToString(CultureInfo.InvariantCulture) +
                             " | cablePulses=" + cablePulses.ToString(CultureInfo.InvariantCulture) +
                             " | networkCalls=" + networkCalls.ToString(CultureInfo.InvariantCulture) +
+                            " | switchMethodCalls=" + switchMethodCalls.ToString(CultureInfo.InvariantCulture) +
                             " | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                         yield break;
                     }
@@ -3561,7 +3569,7 @@ namespace AutoSwitch
 
                 AutoSwitchMod.LogToFile(
                     "SWITCH WAKE | reason=" + reason +
-                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | cablePulses=0 | networkCalls=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
+                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | cablePulses=0 | networkCalls=0 | switchMethodCalls=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                 yield break;
             }
         }
@@ -3569,6 +3577,77 @@ namespace AutoSwitch
         private static int InvokeNetworkWakeCandidates(NetworkMap networkMap)
         {
             return 0;
+        }
+
+        private static readonly string[] SwitchWakeMethodNameHints =
+        {
+            "CheckConnections",
+            "CheckConnection",
+            "RefreshConnections",
+            "RefreshConnection",
+            "RefreshPorts",
+            "RefreshPort",
+            "UpdatePorts",
+            "UpdatePort",
+            "UpdateConnections",
+            "UpdateConnection",
+            "RebuildPorts",
+            "RebuildPort",
+            "RebuildConnections",
+            "RebuildConnection",
+            "DirtyPorts",
+            "DirtyPort",
+            "MarkDirty",
+            "SetDirty",
+            "RefreshPower",
+            "CheckPower",
+            "UpdatePower",
+            "Recalculate",
+            "RefreshStatus",
+            "UpdateStatus"
+        };
+
+        private static int InvokeSwitchWakeCandidates(GameObject root)
+        {
+            if (root == null)
+                return 0;
+
+            int invoked = 0;
+            Component[] components;
+            try
+            {
+                components = root.GetComponentsInChildren<Component>(true);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (components == null)
+                return 0;
+
+            foreach (Component component in components)
+            {
+                if (component == null)
+                    continue;
+
+                Type type = component.GetType();
+                if (type == null)
+                    continue;
+
+                string typeName = type.FullName ?? type.Name ?? string.Empty;
+                if (typeName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Port", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Socket", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Cable", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                foreach (string methodName in SwitchWakeMethodNameHints)
+                    invoked += TryInvokeCachedWakeMethod(component, methodName);
+            }
+
+            return invoked;
         }
 
         private static int TryInvokeCachedWakeMethod(object target, string methodName)
@@ -3580,7 +3659,11 @@ namespace AutoSwitch
             System.Reflection.MethodInfo method;
             if (!CachedWakeMethods.TryGetValue(cacheKey, out method))
             {
-                method = AccessTools.Method(target.GetType(), methodName, Type.EmptyTypes);
+                method = target.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(m =>
+                        string.Equals(m.Name, methodName, StringComparison.OrdinalIgnoreCase) &&
+                        m.GetParameters().Length == 0 &&
+                        m.ReturnType != typeof(IEnumerator));
                 CachedWakeMethods[cacheKey] = method;
             }
 
