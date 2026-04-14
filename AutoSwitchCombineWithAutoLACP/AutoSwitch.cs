@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.11", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.12a", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.11 active. Public-release refinement with balanced pooled exits and reload wake pulse.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.12a active. Reload wake retry pulse with quiet server refresh and public-release cleanup.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -146,6 +146,7 @@ namespace AutoSwitch
 
             SaveDataAutoLACP.ResetForScene();
             SaveDataAutoLACP.StartSafeBootstrap();
+            SaveDataAutoLACP.QueueSceneWakePulse();
 
             LogToFile("Scene loaded: " + sceneName + " (" + buildIndex.ToString(CultureInfo.InvariantCulture) + ")");
         }
@@ -3175,6 +3176,11 @@ namespace AutoSwitch
             _ownedGroupIds.Clear();
         }
 
+        internal static void QueueSceneWakePulse()
+        {
+            QueueServerWakePulse("scene bootstrap");
+        }
+
         internal static HashSet<int> GetOwnedGroupIdsSnapshot()
         {
             return new HashSet<int>(_ownedGroupIds);
@@ -3432,6 +3438,9 @@ namespace AutoSwitch
 
         private static IEnumerator RunServerWakePulse(string reason)
         {
+            const int maxAttempts = 8;
+            const float retryDelaySeconds = 0.75f;
+
             yield return new WaitForSeconds(0.60f);
             _serverWakeQueued = false;
 
@@ -3439,77 +3448,116 @@ namespace AutoSwitch
             if (now - _lastServerWakeRealtime < 1.0f)
                 yield break;
 
-            _lastServerWakeRealtime = now;
-
-            int touched = 0;
-            int methodsInvoked = 0;
-
-            try
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                foreach (Component component in UnityEngine.Object.FindObjectsOfType<Component>())
+                Dictionary<int, GameObject> serverRoots = new Dictionary<int, GameObject>();
+                int touched = 0;
+                int behaviourToggles = 0;
+                int objectPulses = 0;
+
+                try
                 {
-                    if (component == null)
-                        continue;
-
-                    Type type = component.GetType();
-                    if (type == null)
-                        continue;
-
-                    string typeName = type.FullName ?? type.Name ?? string.Empty;
-                    if (typeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0)
-                        continue;
-
-                    touched++;
-
-                    try
+                    foreach (Component component in UnityEngine.Object.FindObjectsOfType<Component>())
                     {
-                        Behaviour behaviour = component as Behaviour;
-                        if (behaviour != null)
-                        {
-                            bool original = behaviour.enabled;
-                            behaviour.enabled = !original;
-                            behaviour.enabled = original;
-                        }
+                        if (component == null || component.gameObject == null)
+                            continue;
+
+                        Type type = component.GetType();
+                        if (type == null)
+                            continue;
+
+                        string typeName = type.FullName ?? type.Name ?? string.Empty;
+                        if (typeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+
+                        GameObject go = component.gameObject;
+                        if (go == null)
+                            continue;
+
+                        int id = go.GetInstanceID();
+                        if (!serverRoots.ContainsKey(id))
+                            serverRoots[id] = go;
                     }
-                    catch { }
 
-                    string[] wakeMethods = new[]
+                    if (serverRoots.Count > 0)
                     {
-                        "UpdateNetworkConnection",
-                        "RefreshNetworkState",
-                        "RefreshConnectionState",
-                        "RefreshPowerState",
-                        "CheckPower",
-                        "CheckConnections",
-                        "UpdatePowerState",
-                        "UpdateStatus"
-                    };
+                        _lastServerWakeRealtime = Time.realtimeSinceStartup;
 
-                    foreach (string methodName in wakeMethods)
-                    {
-                        try
+                        foreach (GameObject serverRoot in serverRoots.Values)
                         {
-                            MethodInfo method = AccessTools.Method(type, methodName, Type.EmptyTypes);
-                            if (method == null)
+                            if (serverRoot == null)
                                 continue;
 
-                            method.Invoke(component, null);
-                            methodsInvoked++;
+                            touched++;
+
+                            try
+                            {
+                                if (serverRoot.activeSelf)
+                                {
+                                    serverRoot.SetActive(false);
+                                    serverRoot.SetActive(true);
+                                }
+                                else
+                                {
+                                    serverRoot.SetActive(true);
+                                }
+
+                                objectPulses++;
+                            }
+                            catch { }
+
+                            foreach (Behaviour behaviour in serverRoot.GetComponentsInChildren<Behaviour>(true))
+                            {
+                                if (behaviour == null)
+                                    continue;
+
+                                string behaviourTypeName = behaviour.GetType().FullName ?? behaviour.GetType().Name ?? string.Empty;
+                                if (behaviourTypeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                    behaviourTypeName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                    behaviourTypeName.IndexOf("Network", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                    behaviourTypeName.IndexOf("Status", StringComparison.OrdinalIgnoreCase) < 0)
+                                    continue;
+
+                                try
+                                {
+                                    bool original = behaviour.enabled;
+                                    behaviour.enabled = !original;
+                                    behaviour.enabled = original;
+                                    behaviourToggles++;
+                                }
+                                catch { }
+                            }
                         }
-                        catch { }
+
+                        AutoSwitchMod.LogToFile(
+                            "SERVER WAKE | reason=" + reason +
+                            " | touched=" + touched.ToString(CultureInfo.InvariantCulture) +
+                            " | behaviourToggles=" + behaviourToggles.ToString(CultureInfo.InvariantCulture) +
+                            " | objectPulses=" + objectPulses.ToString(CultureInfo.InvariantCulture) +
+                            " | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
+                        yield break;
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                AutoSwitchMod.LogToFile("SERVER WAKE | failed | reason=" + reason + " | " + ex.Message);
+                catch (Exception ex)
+                {
+                    AutoSwitchMod.LogToFile(
+                        "SERVER WAKE | failed | reason=" + reason +
+                        " | attempt=" + attempt.ToString(CultureInfo.InvariantCulture) +
+                        " | " + ex.Message);
+                    yield break;
+                }
+
+                if (attempt < maxAttempts)
+                {
+                    yield return new WaitForSeconds(retryDelaySeconds);
+                    continue;
+                }
+
+                AutoSwitchMod.LogToFile(
+                    "SERVER WAKE | reason=" + reason +
+                    " | touched=0 | behaviourToggles=0 | objectPulses=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                 yield break;
             }
-
-            AutoSwitchMod.LogToFile(
-                "SERVER WAKE | reason=" + reason +
-                " | touched=" + touched.ToString(CultureInfo.InvariantCulture) +
-                " | methodsInvoked=" + methodsInvoked.ToString(CultureInfo.InvariantCulture));
         }
 
         private static string BuildDesiredSignature(List<BundleBuilder> bundles, HashSet<string> managedIds)
