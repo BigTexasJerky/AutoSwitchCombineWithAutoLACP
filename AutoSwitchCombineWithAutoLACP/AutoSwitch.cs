@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.7", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.8", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -106,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.7 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.8 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.7 active. Fabric-controller cable-backed spine mode plus dormant-member feeds.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.8 active. Unified-fabric traffic pooling plus route augmentation.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -286,7 +286,11 @@ namespace AutoSwitch
 
                 foreach (RemoteEdgeAccumulator accumulator in accumulators.Values.OrderBy(a => a.RemoteDeviceId, StringComparer.OrdinalIgnoreCase))
                 {
-                    if (accumulator.TotalCableCount >= 2 && accumulator.LocalBuckets.Count > 1)
+                    List<int> distinctIds = accumulator.AllCableIds.Distinct().OrderBy(x => x).ToList();
+                    if (distinctIds.Count < 2)
+                        continue;
+
+                    if (accumulator.LocalBuckets.Count > 1)
                     {
                         fanoutCandidateCount++;
                         foreach (int cableId in accumulator.AllCableIds)
@@ -295,55 +299,48 @@ namespace AutoSwitch
                         LogFanoutCandidate(plan, accumulator);
                     }
 
-                    foreach (LocalEdgeBucket bucket in accumulator.LocalBuckets.Values.OrderBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase))
+                    BundleBuilder bundle = new BundleBuilder();
+                    bundle.FabricId = plan.FabricId;
+                    bundle.DomainId = plan.DomainId;
+                    bundle.FabricEstimatedSpeedGbps = plan.EstimatedCapacityGbps;
+                    bundle.OwnerLocalDeviceId = ChooseBundleOwner(plan, accumulator);
+                    bundle.RemoteDeviceId = accumulator.RemoteDeviceId;
+                    bundle.IsIngressPreferredOwner =
+                        string.Equals(bundle.OwnerLocalDeviceId, plan.IngressAnchorSwitchId, StringComparison.OrdinalIgnoreCase);
+                    bundle.IsPredictedDownstreamExit = accumulator.IsDownstreamExit || accumulator.IsDomainExit;
+
+                    foreach (string localMember in accumulator.LocalBuckets.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                        bundle.LocalMemberIds.Add(localMember);
+
+                    foreach (int cableId in distinctIds)
                     {
-                        List<int> distinctIds = bucket.CableIds.Distinct().OrderBy(x => x).ToList();
-                        if (distinctIds.Count < 2)
-                            continue;
+                        bundle.CableIds.Add(cableId);
+                        fabricCableIds.Add(cableId);
+                    }
 
-                        BundleBuilder bundle = new BundleBuilder();
-                        bundle.FabricId = plan.FabricId;
-                        bundle.DomainId = plan.DomainId;
-                        bundle.FabricEstimatedSpeedGbps = plan.EstimatedCapacityGbps;
-                        bundle.OwnerLocalDeviceId = bucket.OwnerLocalDeviceId;
-                        bundle.RemoteDeviceId = accumulator.RemoteDeviceId;
-                        bundle.IsIngressPreferredOwner =
-                            string.Equals(bundle.OwnerLocalDeviceId, plan.IngressAnchorSwitchId, StringComparison.OrdinalIgnoreCase);
-                        bundle.IsPredictedDownstreamExit = accumulator.IsDownstreamExit || accumulator.IsDomainExit;
+                    allBundles.Add(bundle);
+                    safeNativeBundleCount++;
 
-                        foreach (string localMember in bucket.LocalMembers.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
-                            bundle.LocalMemberIds.Add(localMember);
+                    string signature =
+                        bundle.FabricId + "|" +
+                        bundle.DomainId + "|" +
+                        bundle.OwnerLocalDeviceId + "|" +
+                        bundle.RemoteDeviceId + "|" +
+                        string.Join(",", bundle.CableIds.OrderBy(x => x));
 
-                        foreach (int cableId in distinctIds)
-                        {
-                            bundle.CableIds.Add(cableId);
-                            fabricCableIds.Add(cableId);
-                        }
-
-                        allBundles.Add(bundle);
-                        safeNativeBundleCount++;
-
-                        string signature =
-                            bundle.FabricId + "|" +
-                            bundle.DomainId + "|" +
-                            bundle.OwnerLocalDeviceId + "|" +
-                            bundle.RemoteDeviceId + "|" +
-                            string.Join(",", bundle.CableIds.OrderBy(x => x));
-
-                        if (LoggedBundleSignatures.Add(signature))
-                        {
-                            LogToFile(
-                                "SAFE NATIVE BUNDLE | fabricId=" + bundle.FabricId +
-                                " | domainId=" + bundle.DomainId +
-                                " | ownerLocal=" + bundle.OwnerLocalDeviceId +
-                                " | ownerIsAnchor=" + bundle.IsIngressPreferredOwner.ToString().ToLowerInvariant() +
-                                " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
-                                " | remote=" + bundle.RemoteDeviceId +
-                                " | downstreamExit=" + bundle.IsPredictedDownstreamExit.ToString().ToLowerInvariant() +
-                                " | cableCount=" + bundle.CableIds.Count.ToString(CultureInfo.InvariantCulture) +
-                                " | cableIds=[" + string.Join(",", bundle.CableIds.OrderBy(x => x)) + "]"
-                            );
-                        }
+                    if (LoggedBundleSignatures.Add(signature))
+                    {
+                        LogToFile(
+                            "SAFE NATIVE BUNDLE | fabricId=" + bundle.FabricId +
+                            " | domainId=" + bundle.DomainId +
+                            " | ownerLocal=" + bundle.OwnerLocalDeviceId +
+                            " | ownerIsAnchor=" + bundle.IsIngressPreferredOwner.ToString().ToLowerInvariant() +
+                            " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                            " | remote=" + bundle.RemoteDeviceId +
+                            " | downstreamExit=" + bundle.IsPredictedDownstreamExit.ToString().ToLowerInvariant() +
+                            " | cableCount=" + bundle.CableIds.Count.ToString(CultureInfo.InvariantCulture) +
+                            " | cableIds=[" + string.Join(",", bundle.CableIds.OrderBy(x => x)) + "]"
+                        );
                     }
                 }
 
@@ -707,6 +704,40 @@ namespace AutoSwitch
                 profile.CustomerBaseScore += 250f;
 
             return profile;
+        }
+
+        private static string ChooseBundleOwner(FabricRuntimePlan plan, RemoteEdgeAccumulator accumulator)
+        {
+            if (plan == null)
+                return string.Empty;
+
+            if (accumulator != null && accumulator.IsManagedRemote && !accumulator.IsDomainExit)
+            {
+                if (!string.IsNullOrWhiteSpace(plan.PreferredDomainUplinkSwitchId) &&
+                    plan.MemberIds.Contains(plan.PreferredDomainUplinkSwitchId))
+                {
+                    return plan.PreferredDomainUplinkSwitchId;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(plan.IngressAnchorSwitchId) &&
+                plan.MemberIds.Contains(plan.IngressAnchorSwitchId))
+            {
+                return plan.IngressAnchorSwitchId;
+            }
+
+            if (accumulator != null)
+            {
+                LocalEdgeBucket biggest = accumulator.LocalBuckets.Values
+                    .OrderByDescending(b => b.CableIds.Distinct().Count())
+                    .ThenBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+
+                if (biggest != null && !string.IsNullOrWhiteSpace(biggest.OwnerLocalDeviceId))
+                    return biggest.OwnerLocalDeviceId;
+            }
+
+            return plan.MemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).FirstOrDefault() ?? string.Empty;
         }
 
         private static Dictionary<string, RemoteEdgeAccumulator> BuildRemoteEdgeAccumulators(
@@ -1157,7 +1188,7 @@ namespace AutoSwitch
             object __instance,
             string __0,
             string __1,
-            ref List<List<string>> __result)
+            ref Il2CppSystem.Collections.Generic.List<Il2CppSystem.Collections.Generic.List<string>> __result)
         {
             try
             {
@@ -1173,19 +1204,27 @@ namespace AutoSwitch
                     return;
 
                 if (__result == null)
-                    __result = new List<List<string>>();
+                    __result = new Il2CppSystem.Collections.Generic.List<Il2CppSystem.Collections.Generic.List<string>>();
 
                 string newSignature = string.Join(">", route);
-                foreach (List<string> existing in __result)
+                foreach (Il2CppSystem.Collections.Generic.List<string> existing in __result)
                 {
                     if (existing == null)
                         continue;
 
-                    if (string.Equals(string.Join(">", existing), newSignature, StringComparison.OrdinalIgnoreCase))
+                    List<string> existingManaged = new List<string>();
+                    foreach (string hop in existing)
+                        existingManaged.Add(hop);
+
+                    if (string.Equals(string.Join(">", existingManaged), newSignature, StringComparison.OrdinalIgnoreCase))
                         return;
                 }
 
-                __result.Add(route);
+                Il2CppSystem.Collections.Generic.List<string> il2cppRoute = new Il2CppSystem.Collections.Generic.List<string>();
+                foreach (string hop in route)
+                    il2cppRoute.Add(hop);
+
+                __result.Add(il2cppRoute);
 
                 LogToFile(
                     "VIRTUAL ROUTE | start=" + __0 +
@@ -3205,19 +3244,6 @@ namespace AutoSwitch
                 if (distinctIds.Count < 2)
                     continue;
 
-                if (bundle.LocalMemberIds.Count != 1)
-                {
-                    AutoSwitchMod.LogToFile(
-                        "AUTO LACP | skipped multi-local bundle | fabricId=" + bundle.FabricId +
-                        " | domainId=" + bundle.DomainId +
-                        " | ownerLocal=" + bundle.OwnerLocalDeviceId +
-                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
-                        " | deviceB=" + bundle.RemoteDeviceId +
-                        " | cableIds=[" + string.Join(",", distinctIds) + "]"
-                    );
-                    continue;
-                }
-
                 try
                 {
                     Il2CppSystem.Collections.Generic.List<int> il2cppCableIds = new Il2CppSystem.Collections.Generic.List<int>();
@@ -3256,6 +3282,7 @@ namespace AutoSwitch
                         " | ownerLocal=" + bundle.OwnerLocalDeviceId +
                         " | ownerIsAnchor=" + bundle.IsIngressPreferredOwner.ToString().ToLowerInvariant() +
                         " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                        " | pooledLocalCount=" + bundle.LocalMemberIds.Count.ToString(CultureInfo.InvariantCulture) +
                         " | deviceB=" + bundle.RemoteDeviceId +
                         " | downstreamExit=" + bundle.IsPredictedDownstreamExit.ToString().ToLowerInvariant() +
                         " | cableIds=[" + string.Join(",", distinctIds) + "]"
@@ -3268,6 +3295,7 @@ namespace AutoSwitch
                         " | domainId=" + bundle.DomainId +
                         " | ownerLocal=" + bundle.OwnerLocalDeviceId +
                         " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                        " | pooledLocalCount=" + bundle.LocalMemberIds.Count.ToString(CultureInfo.InvariantCulture) +
                         " | deviceB=" + bundle.RemoteDeviceId +
                         " | cableIds=[" + string.Join(",", distinctIds) + "]" +
                         " | " + ex
