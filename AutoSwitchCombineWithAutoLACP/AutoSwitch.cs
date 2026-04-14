@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.9", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.10", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -111,7 +111,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.8 active. Unified-fabric pooling with route-only inter-fabric bridges.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.10 active. Core-anchor pooling with isolated inter-fabric routing bridges.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -493,9 +493,29 @@ namespace AutoSwitch
             return plans;
         }
 
+
+        private static bool IsLowTierSwitchId(string deviceId)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId))
+                return false;
+
+            return deviceId.StartsWith("Switch16CU", StringComparison.OrdinalIgnoreCase) ||
+                   deviceId.StartsWith("Switch4xSFP", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsCoreSwitchId(string deviceId)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId))
+                return false;
+
+            return deviceId.StartsWith("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) ||
+                   deviceId.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static void ChooseFabricAnchor(FabricRuntimePlan plan)
         {
             SwitchTrafficProfile forcedHint = plan.SwitchProfiles.Values
+                .Where(p => p != null && IsCoreSwitchId(p.DeviceId))
                 .FirstOrDefault(p => EndsWithRuntimeSuffix(p.DeviceId, PreferredIngressSuffixHint));
 
             if (forcedHint != null)
@@ -506,6 +526,7 @@ namespace AutoSwitch
             else
             {
                 SwitchTrafficProfile best = plan.SwitchProfiles.Values
+                    .Where(p => p != null && IsCoreSwitchId(p.DeviceId))
                     .OrderByDescending(p => p.CustomerBaseScore)
                     .ThenByDescending(p => p.IngressScore)
                     .ThenByDescending(p => p.ExternalServerEdgeCount)
@@ -513,6 +534,17 @@ namespace AutoSwitch
                     .ThenByDescending(p => p.DomainExitEdgeCount)
                     .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
                     .FirstOrDefault();
+
+                if (best == null)
+                {
+                    best = plan.SwitchProfiles.Values
+                        .Where(p => p != null)
+                        .OrderBy(p => IsLowTierSwitchId(p.DeviceId) ? 1 : 0)
+                        .ThenByDescending(p => p.CustomerBaseScore)
+                        .ThenByDescending(p => p.IngressScore)
+                        .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
+                        .FirstOrDefault();
+                }
 
                 plan.IngressAnchorSwitchId = best != null ? best.DeviceId : string.Empty;
                 plan.AnchorCustomerBaseScore = best != null ? best.CustomerBaseScore : 0f;
@@ -943,35 +975,23 @@ namespace AutoSwitch
             List<string> allFabricIds)
         {
             Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            HashSet<string> visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int domainIndex = 1;
 
-            foreach (string start in allFabricIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            foreach (string fabricId in allFabricIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
             {
-                if (visited.Contains(start))
-                    continue;
-
                 string domainId = "DOMAIN-" + domainIndex.ToString("000", CultureInfo.InvariantCulture);
                 domainIndex++;
+                result[fabricId] = domainId;
+            }
 
-                Queue<string> queue = new Queue<string>();
-                queue.Enqueue(start);
-                visited.Add(start);
-
-                while (queue.Count > 0)
+            foreach (KeyValuePair<string, HashSet<string>> kvp in fabricAdjacency.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                foreach (string neighbor in kvp.Value.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                 {
-                    string current = queue.Dequeue();
-                    result[current] = domainId;
-
-                    HashSet<string> neighbors;
-                    if (!fabricAdjacency.TryGetValue(current, out neighbors))
-                        continue;
-
-                    foreach (string neighbor in neighbors)
-                    {
-                        if (visited.Add(neighbor))
-                            queue.Enqueue(neighbor);
-                    }
+                    LogToFile(
+                        "DOMAIN LINK SKIPPED | fabricA=" + kvp.Key +
+                        " | fabricB=" + neighbor +
+                        " | reason=insufficient-physical-bridge");
                 }
             }
 
@@ -1443,15 +1463,19 @@ namespace AutoSwitch
                 AddEdge(anchor, dormant, "anchor-dormant");
 
             // Also give low-visibility members a direct feed even if they only touch one weak synthetic link.
-            foreach (SwitchTrafficProfile profile in plan.SwitchProfiles.Values
-                .Where(p => p != null && !string.IsNullOrWhiteSpace(p.DeviceId))
-                .Where(p => !string.Equals(p.DeviceId, anchor, StringComparison.OrdinalIgnoreCase))
-                .Where(p => p.InternalFabricEdgeCount <= 1)
-                .Where(p => p.ExternalUnknownEdgeCount == 0)
-                .Where(p => p.ExternalServerEdgeCount == 0)
-                .OrderBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase))
+            if (IsCoreSwitchId(anchor))
             {
-                AddEdge(anchor, profile.DeviceId, "anchor-share-weak");
+                foreach (SwitchTrafficProfile profile in plan.SwitchProfiles.Values
+                    .Where(p => p != null && !string.IsNullOrWhiteSpace(p.DeviceId))
+                    .Where(p => !string.Equals(p.DeviceId, anchor, StringComparison.OrdinalIgnoreCase))
+                    .Where(p => !IsLowTierSwitchId(p.DeviceId))
+                    .Where(p => p.InternalFabricEdgeCount <= 1)
+                    .Where(p => p.ExternalUnknownEdgeCount == 0)
+                    .Where(p => p.ExternalServerEdgeCount == 0)
+                    .OrderBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase))
+                {
+                    AddEdge(anchor, profile.DeviceId, "anchor-share-weak");
+                }
             }
 
             // If the anchor somehow had no edges yet, give it a minimal lifeline to the first two members.
