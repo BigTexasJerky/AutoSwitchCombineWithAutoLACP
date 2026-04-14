@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.10", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.11", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -106,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.8 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.11 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.10 active. Core-anchor pooling with isolated inter-fabric routing bridges.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.11 active. Public-release refinement with balanced pooled exits and reload wake pulse.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -755,6 +755,29 @@ namespace AutoSwitch
             if (plan == null)
                 return string.Empty;
 
+            LocalEdgeBucket biggest = null;
+            if (accumulator != null)
+            {
+                biggest = accumulator.LocalBuckets.Values
+                    .OrderByDescending(b => b.CableIds.Distinct().Count())
+                    .ThenBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+
+                if (biggest != null &&
+                    !string.IsNullOrWhiteSpace(biggest.OwnerLocalDeviceId) &&
+                    biggest.CableIds.Distinct().Count() >= 2)
+                {
+                    return biggest.OwnerLocalDeviceId;
+                }
+
+                if (accumulator.LocalBuckets.Count == 1 &&
+                    biggest != null &&
+                    !string.IsNullOrWhiteSpace(biggest.OwnerLocalDeviceId))
+                {
+                    return biggest.OwnerLocalDeviceId;
+                }
+            }
+
             if (accumulator != null && accumulator.IsManagedRemote && !accumulator.IsDomainExit)
             {
                 if (!string.IsNullOrWhiteSpace(plan.PreferredDomainUplinkSwitchId) &&
@@ -770,16 +793,8 @@ namespace AutoSwitch
                 return plan.IngressAnchorSwitchId;
             }
 
-            if (accumulator != null)
-            {
-                LocalEdgeBucket biggest = accumulator.LocalBuckets.Values
-                    .OrderByDescending(b => b.CableIds.Distinct().Count())
-                    .ThenBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase)
-                    .FirstOrDefault();
-
-                if (biggest != null && !string.IsNullOrWhiteSpace(biggest.OwnerLocalDeviceId))
-                    return biggest.OwnerLocalDeviceId;
-            }
+            if (biggest != null && !string.IsNullOrWhiteSpace(biggest.OwnerLocalDeviceId))
+                return biggest.OwnerLocalDeviceId;
 
             return plan.MemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).FirstOrDefault() ?? string.Empty;
         }
@@ -3075,6 +3090,9 @@ namespace AutoSwitch
         {
             try
             {
+                if (!ShouldWriteDebugLine(message))
+                    return;
+
                 Directory.CreateDirectory(DebugFolderPath);
                 File.AppendAllText(
                     DebugLogPath,
@@ -3082,6 +3100,30 @@ namespace AutoSwitch
                 );
             }
             catch { }
+        }
+
+        private static bool ShouldWriteDebugLine(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            string[] noisyPrefixes = new[]
+            {
+                "GRAPH TYPE |",
+                "CABLE TUPLE TYPE |",
+                "REMOTE RESOLVE |",
+                "REHYDRATED PROFILE |",
+                "SYNTHETIC CABLE REGISTERED |",
+                "VIRTUAL EDGE |"
+            };
+
+            foreach (string prefix in noisyPrefixes)
+            {
+                if (message.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
         }
     }
 
@@ -3092,6 +3134,8 @@ namespace AutoSwitch
         private static float _lastRunRealtime;
         private static string _lastAppliedSignature = string.Empty;
         private static bool _hasAppliedAtLeastOnce;
+        private static bool _serverWakeQueued;
+        private static float _lastServerWakeRealtime;
 
         private const float InitialDelaySeconds = 8.0f;
         private const float MinDelaySeconds = 0.35f;
@@ -3119,6 +3163,8 @@ namespace AutoSwitch
             _lastRunRealtime = 0f;
             _lastAppliedSignature = string.Empty;
             _hasAppliedAtLeastOnce = false;
+            _serverWakeQueued = false;
+            _lastServerWakeRealtime = 0f;
 
             lock (_stateLock)
             {
@@ -3205,6 +3251,7 @@ namespace AutoSwitch
             try
             {
                 RebuildAutoLacpGroups();
+                QueueServerWakePulse("lacp regroup");
                 _hasAppliedAtLeastOnce = true;
             }
             catch (Exception ex)
@@ -3372,6 +3419,97 @@ namespace AutoSwitch
                 " | desiredBundles=" + desiredBundles.Count.ToString(CultureInfo.InvariantCulture) +
                 " | ownedNow=" + _ownedGroupIds.Count.ToString(CultureInfo.InvariantCulture)
             );
+        }
+
+        private static void QueueServerWakePulse(string reason)
+        {
+            if (_serverWakeQueued)
+                return;
+
+            _serverWakeQueued = true;
+            MelonCoroutines.Start(RunServerWakePulse(reason));
+        }
+
+        private static IEnumerator RunServerWakePulse(string reason)
+        {
+            yield return new WaitForSeconds(0.60f);
+            _serverWakeQueued = false;
+
+            float now = Time.realtimeSinceStartup;
+            if (now - _lastServerWakeRealtime < 1.0f)
+                yield break;
+
+            _lastServerWakeRealtime = now;
+
+            int touched = 0;
+            int methodsInvoked = 0;
+
+            try
+            {
+                foreach (Component component in UnityEngine.Object.FindObjectsOfType<Component>())
+                {
+                    if (component == null)
+                        continue;
+
+                    Type type = component.GetType();
+                    if (type == null)
+                        continue;
+
+                    string typeName = type.FullName ?? type.Name ?? string.Empty;
+                    if (typeName.IndexOf("Server", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    touched++;
+
+                    try
+                    {
+                        Behaviour behaviour = component as Behaviour;
+                        if (behaviour != null)
+                        {
+                            bool original = behaviour.enabled;
+                            behaviour.enabled = !original;
+                            behaviour.enabled = original;
+                        }
+                    }
+                    catch { }
+
+                    string[] wakeMethods = new[]
+                    {
+                        "UpdateNetworkConnection",
+                        "RefreshNetworkState",
+                        "RefreshConnectionState",
+                        "RefreshPowerState",
+                        "CheckPower",
+                        "CheckConnections",
+                        "UpdatePowerState",
+                        "UpdateStatus"
+                    };
+
+                    foreach (string methodName in wakeMethods)
+                    {
+                        try
+                        {
+                            MethodInfo method = AccessTools.Method(type, methodName, Type.EmptyTypes);
+                            if (method == null)
+                                continue;
+
+                            method.Invoke(component, null);
+                            methodsInvoked++;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AutoSwitchMod.LogToFile("SERVER WAKE | failed | reason=" + reason + " | " + ex.Message);
+                yield break;
+            }
+
+            AutoSwitchMod.LogToFile(
+                "SERVER WAKE | reason=" + reason +
+                " | touched=" + touched.ToString(CultureInfo.InvariantCulture) +
+                " | methodsInvoked=" + methodsInvoked.ToString(CultureInfo.InvariantCulture));
         }
 
         private static string BuildDesiredSignature(List<BundleBuilder> bundles, HashSet<string> managedIds)
