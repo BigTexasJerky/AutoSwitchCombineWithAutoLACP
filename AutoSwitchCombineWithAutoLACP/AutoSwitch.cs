@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.17.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.19.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -60,6 +60,15 @@ namespace AutoSwitch
         private static readonly Dictionary<string, List<int>> FabricIdToBundleCableIds =
             new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
 
+        private static readonly Dictionary<string, string> DeviceIdToFabricIdSnapshot =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<string, string> FabricIdToDomainSnapshot =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<string, FabricRuntimePlan> FabricPlansSnapshot =
+            new Dictionary<string, FabricRuntimePlan>(StringComparer.OrdinalIgnoreCase);
+
         private static readonly HashSet<string> LoggedPatches =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -69,10 +78,16 @@ namespace AutoSwitch
         private static readonly HashSet<string> LoggedRemoteResolutionSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly HashSet<string> LoggedCrossFabricSignatures =
+        private static readonly HashSet<string> LoggedDomainLinkSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly HashSet<string> LoggedUnknownRemoteCandidateSignatures =
+        private static readonly HashSet<string> LoggedFanoutCandidateSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedPropagationSignatures =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> LoggedFabricPlanSignatures =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private float _nextScanTime;
@@ -85,12 +100,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.17.0 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.19.0 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.17.0 active. Fabric-to-remote bundle mode.");
+            MelonLogger.Msg("[AutoSwitch] v2.19.0 active. Fabric share planner + routing-domain propagation.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -105,10 +120,16 @@ namespace AutoSwitch
             RegisteredCables.Clear();
             FabricIdToSpeed.Clear();
             FabricIdToBundleCableIds.Clear();
+            DeviceIdToFabricIdSnapshot.Clear();
+            FabricIdToDomainSnapshot.Clear();
+            FabricPlansSnapshot.Clear();
+
             LoggedBundleSignatures.Clear();
             LoggedRemoteResolutionSignatures.Clear();
-            LoggedCrossFabricSignatures.Clear();
-            LoggedUnknownRemoteCandidateSignatures.Clear();
+            LoggedDomainLinkSignatures.Clear();
+            LoggedFanoutCandidateSignatures.Clear();
+            LoggedPropagationSignatures.Clear();
+            LoggedFabricPlanSignatures.Clear();
 
             SaveDataAutoLACP.ResetForScene();
             SaveDataAutoLACP.StartSafeBootstrap();
@@ -141,6 +162,9 @@ namespace AutoSwitch
             List<RegisteredSwitchInfo> liveSwitches = RegisteredSwitches.Values
                 .Where(s => s != null && s.HasWorldPosition && IsAllowedSwitchModel(s.ModelName))
                 .Where(IsLikelyPlacedSwitch)
+                .OrderBy(s => s.WorldPosition.x)
+                .ThenBy(s => s.WorldPosition.y)
+                .ThenBy(s => s.WorldPosition.z)
                 .ToList();
 
             List<List<RegisteredSwitchInfo>> fabrics = BuildRegistryFabrics(liveSwitches)
@@ -150,103 +174,173 @@ namespace AutoSwitch
                 .ToList();
 
             Dictionary<string, string> deviceIdToFabricId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, HashSet<string>> fabricIdToMembers = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
             for (int i = 0; i < fabrics.Count; i++)
             {
                 string fabricId = "FABRIC-" + (i + 1).ToString("000", CultureInfo.InvariantCulture);
+                HashSet<string> members = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                 foreach (RegisteredSwitchInfo sw in fabrics[i])
                 {
                     if (sw != null && !string.IsNullOrWhiteSpace(sw.DeviceName))
+                    {
                         deviceIdToFabricId[sw.DeviceName] = fabricId;
+                        members.Add(sw.DeviceName);
+                    }
                 }
+
+                fabricIdToMembers[fabricId] = members;
             }
+
+            DeviceIdToFabricIdSnapshot.Clear();
+            foreach (KeyValuePair<string, string> kvp in deviceIdToFabricId)
+                DeviceIdToFabricIdSnapshot[kvp.Key] = kvp.Value;
+
+            HashSet<string> allManagedIds = new HashSet<string>(
+                deviceIdToFabricId.Keys,
+                StringComparer.OrdinalIgnoreCase);
 
             NetworkSaveData networkSaveData = GetNetworkSaveData();
             int saveCableCount = CountSaveCables(networkSaveData);
-
             HashSet<int> externalLacpCableIds = GetExternalLacpCableIds(networkSaveData);
 
             FabricIdToSpeed.Clear();
             FabricIdToBundleCableIds.Clear();
+            FabricPlansSnapshot.Clear();
+
+            Dictionary<string, HashSet<string>> fabricAdjacency =
+                BuildFabricAdjacency(deviceIdToFabricId, externalLacpCableIds);
+
+            Dictionary<string, string> fabricToDomain =
+                BuildRoutingDomains(fabricAdjacency, fabricIdToMembers.Keys.ToList());
+
+            FabricIdToDomainSnapshot.Clear();
+            foreach (KeyValuePair<string, string> kvp in fabricToDomain)
+                FabricIdToDomainSnapshot[kvp.Key] = kvp.Value;
+
+            List<FabricRuntimePlan> fabricPlans = BuildFabricRuntimePlans(
+                fabrics,
+                fabricIdToMembers,
+                deviceIdToFabricId,
+                fabricToDomain,
+                externalLacpCableIds);
+
+            foreach (FabricRuntimePlan plan in fabricPlans)
+                FabricPlansSnapshot[plan.FabricId] = plan;
+
+            ApplyFabricTags(fabricPlans);
 
             List<BundleBuilder> allBundles = new List<BundleBuilder>();
-            HashSet<string> allManagedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<int> globallyClaimedCableIds = new HashSet<int>();
 
-            int crossFabricSkipCount = 0;
-            HashSet<int> crossFabricSkippedCableIds = new HashSet<int>();
+            int safeNativeBundleCount = 0;
+            int fanoutCandidateCount = 0;
+            int internalPassThroughCount = 0;
+            int interFabricPassThroughCount = 0;
+            int propagatedEdgeCount = 0;
+            int propagatedDownstreamCount = 0;
 
-            int unknownRemoteCandidateCount = 0;
-            HashSet<int> unknownRemoteCandidateCableIds = new HashSet<int>();
+            HashSet<int> internalPassThroughCableIds = new HashSet<int>();
+            HashSet<int> interFabricPassThroughCableIds = new HashSet<int>();
+            HashSet<int> fanoutCandidateCableIds = new HashSet<int>();
 
-            int fabricIndex = 1;
-
-            foreach (List<RegisteredSwitchInfo> fabric in fabrics)
+            foreach (FabricRuntimePlan plan in fabricPlans.OrderBy(p => p.FabricId, StringComparer.OrdinalIgnoreCase))
             {
-                string fabricId = "FABRIC-" + fabricIndex.ToString("000", CultureInfo.InvariantCulture);
-                float fabricSpeed = fabric.Sum(x => x.EstimatedCapacityGbps);
-                FabricIdToSpeed[fabricId] = fabricSpeed;
+                FabricIdToSpeed[plan.FabricId] = plan.EstimatedCapacityGbps;
 
-                HashSet<string> localIds = new HashSet<string>(
-                    fabric.Select(x => x.DeviceName).Where(x => !string.IsNullOrWhiteSpace(x)),
-                    StringComparer.OrdinalIgnoreCase
-                );
-
-                foreach (string localId in localIds)
-                    allManagedIds.Add(localId);
-
-                Dictionary<string, BundleBuilder> bundlesForFabric =
-                    BuildBundlesForFabricFromLiveRegistry(
-                        fabricId,
-                        localIds,
+                Dictionary<string, RemoteEdgeAccumulator> accumulators =
+                    BuildRemoteEdgeAccumulators(
+                        plan,
                         deviceIdToFabricId,
-                        globallyClaimedCableIds,
+                        fabricToDomain,
                         externalLacpCableIds,
-                        ref crossFabricSkipCount,
-                        crossFabricSkippedCableIds,
-                        ref unknownRemoteCandidateCount,
-                        unknownRemoteCandidateCableIds);
+                        ref internalPassThroughCount,
+                        internalPassThroughCableIds,
+                        ref interFabricPassThroughCount,
+                        interFabricPassThroughCableIds,
+                        ref fanoutCandidateCount,
+                        fanoutCandidateCableIds,
+                        ref propagatedEdgeCount,
+                        ref propagatedDownstreamCount);
 
                 List<int> fabricCableIds = new List<int>();
 
-                foreach (BundleBuilder bundle in bundlesForFabric.Values.OrderBy(b => b.OwnerLocalDeviceId).ThenBy(b => b.RemoteDeviceId))
+                foreach (RemoteEdgeAccumulator accumulator in accumulators.Values.OrderBy(a => a.RemoteDeviceId, StringComparer.OrdinalIgnoreCase))
                 {
-                    bundle.FabricId = fabricId;
-                    bundle.FabricEstimatedSpeedGbps = fabricSpeed;
-                    bundle.RefreshOwner();
+                    if (accumulator.TotalCableCount < 2)
+                        continue;
 
-                    List<int> distinctIds = bundle.CableIds.Distinct().OrderBy(x => x).ToList();
-                    if (distinctIds.Count >= 2)
+                    bool hasPredictableNative = false;
+
+                    foreach (LocalEdgeBucket bucket in accumulator.LocalBuckets.Values.OrderBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase))
                     {
+                        List<int> distinctIds = bucket.CableIds
+                            .Distinct()
+                            .OrderBy(x => x)
+                            .ToList();
+
+                        if (distinctIds.Count < 2)
+                            continue;
+
+                        BundleBuilder bundle = new BundleBuilder();
+                        bundle.FabricId = plan.FabricId;
+                        bundle.DomainId = plan.DomainId;
+                        bundle.FabricEstimatedSpeedGbps = plan.EstimatedCapacityGbps;
+                        bundle.OwnerLocalDeviceId = bucket.OwnerLocalDeviceId;
+                        bundle.RemoteDeviceId = accumulator.RemoteDeviceId;
+
+                        foreach (string localMember in bucket.LocalMembers.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                            bundle.LocalMemberIds.Add(localMember);
+
                         foreach (int cableId in distinctIds)
+                        {
+                            bundle.CableIds.Add(cableId);
                             fabricCableIds.Add(cableId);
+                            globallyClaimedCableIds.Add(cableId);
+                        }
+
+                        bundle.IsIngressPreferredOwner =
+                            string.Equals(bundle.OwnerLocalDeviceId, plan.PreferredIngressSwitchId, StringComparison.OrdinalIgnoreCase);
+
+                        bundle.IsPredictedDownstreamExit = accumulator.IsDomainExit || accumulator.IsExternalDownstream;
 
                         allBundles.Add(bundle);
+                        safeNativeBundleCount++;
+                        hasPredictableNative = true;
 
-                        string localMembers = string.Join(",", bundle.LocalMemberIds.OrderBy(x => x));
                         string signature =
-                            fabricId + "|" +
+                            bundle.FabricId + "|" +
+                            bundle.DomainId + "|" +
                             bundle.OwnerLocalDeviceId + "|" +
                             bundle.RemoteDeviceId + "|" +
-                            localMembers + "|" +
-                            string.Join(",", distinctIds);
+                            string.Join(",", bundle.CableIds.OrderBy(x => x));
 
                         if (LoggedBundleSignatures.Add(signature))
                         {
                             LogToFile(
-                                "LIVE FABRIC BUNDLE | fabricId=" + fabricId +
+                                "SAFE NATIVE BUNDLE | fabricId=" + bundle.FabricId +
+                                " | domainId=" + bundle.DomainId +
                                 " | ownerLocal=" + bundle.OwnerLocalDeviceId +
-                                " | localMembers=[" + localMembers + "]" +
+                                " | ownerPreferredIngress=" + bundle.IsIngressPreferredOwner.ToString().ToLowerInvariant() +
+                                " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
                                 " | remote=" + bundle.RemoteDeviceId +
-                                " | cableCount=" + distinctIds.Count.ToString(CultureInfo.InvariantCulture) +
-                                " | estPerCableGbps=" + (fabricSpeed / distinctIds.Count).ToString("0.##", CultureInfo.InvariantCulture) +
-                                " | cableIds=[" + string.Join(",", distinctIds) + "]"
+                                " | domainExit=" + bundle.IsPredictedDownstreamExit.ToString().ToLowerInvariant() +
+                                " | cableCount=" + bundle.CableIds.Count.ToString(CultureInfo.InvariantCulture) +
+                                " | cableIds=[" + string.Join(",", bundle.CableIds.OrderBy(x => x)) + "]"
                             );
                         }
                     }
+
+                    if (!hasPredictableNative && accumulator.TotalCableCount >= 2)
+                    {
+                        LogFanoutCandidate(plan, accumulator);
+                        foreach (int cableId in accumulator.AllCableIds)
+                            fanoutCandidateCableIds.Add(cableId);
+                    }
                 }
 
-                FabricIdToBundleCableIds[fabricId] = fabricCableIds;
-                fabricIndex++;
+                FabricIdToBundleCableIds[plan.FabricId] = fabricCableIds.Distinct().OrderBy(x => x).ToList();
             }
 
             SaveDataAutoLACP.UpdateDesiredState(allBundles, allManagedIds);
@@ -257,11 +351,16 @@ namespace AutoSwitch
                 " | registeredCables=" + RegisteredCables.Count.ToString(CultureInfo.InvariantCulture) +
                 " | saveCables=" + saveCableCount.ToString(CultureInfo.InvariantCulture) +
                 " | externalLacpCableIds=" + externalLacpCableIds.Count.ToString(CultureInfo.InvariantCulture) +
-                " | crossFabricSkipped=" + crossFabricSkipCount.ToString(CultureInfo.InvariantCulture) +
-                " | unknownRemoteCandidates=" + unknownRemoteCandidateCount.ToString(CultureInfo.InvariantCulture) +
                 " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture) +
                 " | activeFabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) +
+                " | routingDomains=" + fabricToDomain.Values.Distinct(StringComparer.OrdinalIgnoreCase).Count().ToString(CultureInfo.InvariantCulture) +
                 " | adjacentPairs=" + adjacencyPairs.ToString(CultureInfo.InvariantCulture) +
+                " | safeNativeBundles=" + safeNativeBundleCount.ToString(CultureInfo.InvariantCulture) +
+                " | fanoutCandidates=" + fanoutCandidateCount.ToString(CultureInfo.InvariantCulture) +
+                " | propagatedEdges=" + propagatedEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                " | propagatedDownstream=" + propagatedDownstreamCount.ToString(CultureInfo.InvariantCulture) +
+                " | internalPassThrough=" + internalPassThroughCount.ToString(CultureInfo.InvariantCulture) +
+                " | interFabricPassThrough=" + interFabricPassThroughCount.ToString(CultureInfo.InvariantCulture) +
                 " | bundleCount=" + allBundles.Count.ToString(CultureInfo.InvariantCulture) +
                 " | managedIds=" + allManagedIds.Count.ToString(CultureInfo.InvariantCulture);
 
@@ -271,39 +370,49 @@ namespace AutoSwitch
                 MelonLogger.Msg("[AutoSwitch] " + summary);
                 LogToFile(summary);
 
-                if (externalLacpCableIds.Count > 0)
-                    LogToFile("EXTERNAL LACP CABLE IDS | [" + string.Join(",", externalLacpCableIds.OrderBy(x => x)) + "]");
-
-                if (crossFabricSkippedCableIds.Count > 0)
-                    LogToFile("CROSS FABRIC SKIPPED CABLE IDS | [" + string.Join(",", crossFabricSkippedCableIds.OrderBy(x => x)) + "]");
-
-                if (unknownRemoteCandidateCableIds.Count > 0)
-                    LogToFile("UNKNOWN REMOTE CANDIDATE CABLE IDS | [" + string.Join(",", unknownRemoteCandidateCableIds.OrderBy(x => x)) + "]");
-
-                int logIndex = 1;
-                foreach (List<RegisteredSwitchInfo> fabric in fabrics)
+                foreach (string domainId in fabricToDomain.Values.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                 {
-                    string fabricId = "FABRIC-" + logIndex.ToString("000", CultureInfo.InvariantCulture);
-                    float speed = FabricIdToSpeed.ContainsKey(fabricId)
-                        ? FabricIdToSpeed[fabricId]
-                        : fabric.Sum(x => x.EstimatedCapacityGbps);
+                    List<string> domainFabrics = fabricToDomain
+                        .Where(kvp => string.Equals(kvp.Value, domainId, StringComparison.OrdinalIgnoreCase))
+                        .Select(kvp => kvp.Key)
+                        .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
 
+                    LogToFile("ROUTING DOMAIN | id=" + domainId + " | fabrics=[" + string.Join(",", domainFabrics) + "]");
+                }
+
+                if (internalPassThroughCableIds.Count > 0)
+                    LogToFile("INTERNAL PASS-THROUGH CABLE IDS | [" + string.Join(",", internalPassThroughCableIds.OrderBy(x => x)) + "]");
+
+                if (interFabricPassThroughCableIds.Count > 0)
+                    LogToFile("INTER-FABRIC PASS-THROUGH CABLE IDS | [" + string.Join(",", interFabricPassThroughCableIds.OrderBy(x => x)) + "]");
+
+                if (fanoutCandidateCableIds.Count > 0)
+                    LogToFile("FANOUT CANDIDATE CABLE IDS | [" + string.Join(",", fanoutCandidateCableIds.OrderBy(x => x)) + "]");
+
+                foreach (FabricRuntimePlan plan in fabricPlans.OrderBy(p => p.FabricId, StringComparer.OrdinalIgnoreCase))
+                {
                     List<int> cableIds;
-                    int tracked = FabricIdToBundleCableIds.TryGetValue(fabricId, out cableIds)
+                    int tracked = FabricIdToBundleCableIds.TryGetValue(plan.FabricId, out cableIds)
                         ? cableIds.Distinct().Count()
                         : 0;
 
                     string members = string.Join(", ",
-                        fabric.Select(x => x.DeviceName + "@(" +
-                                           x.WorldPosition.x.ToString("0.###", CultureInfo.InvariantCulture) + "," +
-                                           x.WorldPosition.y.ToString("0.###", CultureInfo.InvariantCulture) + "," +
-                                           x.WorldPosition.z.ToString("0.###", CultureInfo.InvariantCulture) + ")[" +
-                                           x.ModelName + "]"));
+                        plan.Members
+                            .OrderBy(x => x.DeviceName, StringComparer.OrdinalIgnoreCase)
+                            .Select(x => x.DeviceName + "@(" +
+                                         x.WorldPosition.x.ToString("0.###", CultureInfo.InvariantCulture) + "," +
+                                         x.WorldPosition.y.ToString("0.###", CultureInfo.InvariantCulture) + "," +
+                                         x.WorldPosition.z.ToString("0.###", CultureInfo.InvariantCulture) + ")[" +
+                                         x.ModelName + "]"));
 
                     LogToFile(
-                        "FABRIC | id=" + fabricId +
-                        " | members=" + fabric.Count.ToString(CultureInfo.InvariantCulture) +
-                        " | estCapacityGbps=" + speed.ToString("0.##", CultureInfo.InvariantCulture) +
+                        "FABRIC | id=" + plan.FabricId +
+                        " | domainId=" + plan.DomainId +
+                        " | members=" + plan.Members.Count.ToString(CultureInfo.InvariantCulture) +
+                        " | estCapacityGbps=" + plan.EstimatedCapacityGbps.ToString("0.##", CultureInfo.InvariantCulture) +
+                        " | preferredIngress=" + plan.PreferredIngressSwitchId +
+                        " | ingressScore=" + plan.PreferredIngressScore.ToString("0.##", CultureInfo.InvariantCulture) +
                         " | bundledCableIds=" + tracked.ToString(CultureInfo.InvariantCulture) +
                         " | switches=" + members
                     );
@@ -311,13 +420,569 @@ namespace AutoSwitch
                     if (tracked > 0)
                     {
                         LogToFile(
-                            "FABRIC BUNDLE CABLE MAP | fabricId=" + fabricId +
+                            "FABRIC BUNDLE CABLE MAP | fabricId=" + plan.FabricId +
                             " | cableIds=[" + string.Join(",", cableIds.Distinct().OrderBy(x => x)) + "]"
                         );
                     }
 
-                    logIndex++;
+                    LogFabricPlan(plan);
                 }
+            }
+        }
+
+        private static List<FabricRuntimePlan> BuildFabricRuntimePlans(
+            List<List<RegisteredSwitchInfo>> fabrics,
+            Dictionary<string, HashSet<string>> fabricIdToMembers,
+            Dictionary<string, string> deviceIdToFabricId,
+            Dictionary<string, string> fabricToDomain,
+            HashSet<int> externalLacpCableIds)
+        {
+            List<FabricRuntimePlan> plans = new List<FabricRuntimePlan>();
+
+            for (int index = 0; index < fabrics.Count; index++)
+            {
+                string fabricId = "FABRIC-" + (index + 1).ToString("000", CultureInfo.InvariantCulture);
+                List<RegisteredSwitchInfo> fabricMembers = fabrics[index];
+
+                string domainId;
+                if (!fabricToDomain.TryGetValue(fabricId, out domainId))
+                    domainId = fabricId;
+
+                FabricRuntimePlan plan = new FabricRuntimePlan();
+                plan.FabricId = fabricId;
+                plan.DomainId = domainId;
+                plan.EstimatedCapacityGbps = fabricMembers.Sum(x => x.EstimatedCapacityGbps);
+
+                foreach (RegisteredSwitchInfo member in fabricMembers)
+                {
+                    plan.Members.Add(member);
+                    if (member != null && !string.IsNullOrWhiteSpace(member.DeviceName))
+                        plan.MemberIds.Add(member.DeviceName);
+                }
+
+                foreach (RegisteredSwitchInfo member in fabricMembers)
+                {
+                    if (member == null || string.IsNullOrWhiteSpace(member.DeviceName))
+                        continue;
+
+                    SwitchTrafficProfile profile = BuildSwitchTrafficProfile(
+                        member.DeviceName,
+                        fabricId,
+                        deviceIdToFabricId,
+                        fabricToDomain,
+                        externalLacpCableIds);
+
+                    plan.SwitchProfiles[member.DeviceName] = profile;
+                }
+
+                SwitchTrafficProfile preferred = plan.SwitchProfiles.Values
+                    .OrderByDescending(p => p.IngressScore)
+                    .ThenByDescending(p => p.ExternalServerEdgeCount)
+                    .ThenByDescending(p => p.ExternalUnknownEdgeCount)
+                    .ThenByDescending(p => p.DomainExitEdgeCount)
+                    .ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+
+                plan.PreferredIngressSwitchId = preferred != null ? preferred.DeviceId : string.Empty;
+                plan.PreferredIngressScore = preferred != null ? preferred.IngressScore : 0f;
+
+                foreach (SwitchTrafficProfile profile in plan.SwitchProfiles.Values)
+                {
+                    if (profile == null)
+                        continue;
+
+                    profile.IsPreferredIngress = string.Equals(
+                        profile.DeviceId,
+                        plan.PreferredIngressSwitchId,
+                        StringComparison.OrdinalIgnoreCase);
+                }
+
+                plans.Add(plan);
+            }
+
+            BuildDomainPropagationPlans(plans);
+
+            return plans;
+        }
+
+        private static void BuildDomainPropagationPlans(List<FabricRuntimePlan> plans)
+        {
+            Dictionary<string, List<FabricRuntimePlan>> domainGroups = plans
+                .GroupBy(p => p.DomainId, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.OrderBy(p => p.FabricId, StringComparer.OrdinalIgnoreCase).ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            foreach (KeyValuePair<string, List<FabricRuntimePlan>> kvp in domainGroups)
+            {
+                string domainId = kvp.Key;
+                List<FabricRuntimePlan> domainPlans = kvp.Value;
+
+                float domainCapacity = domainPlans.Sum(p => p.EstimatedCapacityGbps);
+
+                foreach (FabricRuntimePlan plan in domainPlans)
+                {
+                    plan.DomainEstimatedCapacityGbps = domainCapacity;
+                    plan.DomainFabricIds = new List<string>(
+                        domainPlans.Select(p => p.FabricId).OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
+
+                    foreach (FabricRuntimePlan peer in domainPlans)
+                    {
+                        if (string.Equals(peer.FabricId, plan.FabricId, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        DomainPropagationIntent intent = new DomainPropagationIntent();
+                        intent.DomainId = domainId;
+                        intent.FromFabricId = plan.FabricId;
+                        intent.ToFabricId = peer.FabricId;
+                        intent.FromPreferredIngress = plan.PreferredIngressSwitchId;
+                        intent.ToPreferredIngress = peer.PreferredIngressSwitchId;
+                        intent.EstimatedBandwidthGbps = Math.Min(plan.EstimatedCapacityGbps, peer.EstimatedCapacityGbps);
+                        intent.IntentKind = "intra-domain-fabric-share";
+                        plan.OutboundPropagationIntents.Add(intent);
+                    }
+                }
+            }
+        }
+
+        private static SwitchTrafficProfile BuildSwitchTrafficProfile(
+            string deviceId,
+            string currentFabricId,
+            Dictionary<string, string> deviceIdToFabricId,
+            Dictionary<string, string> fabricToDomain,
+            HashSet<int> externalLacpCableIds)
+        {
+            SwitchTrafficProfile profile = new SwitchTrafficProfile();
+            profile.DeviceId = deviceId;
+
+            string currentDomainId;
+            if (!fabricToDomain.TryGetValue(currentFabricId, out currentDomainId))
+                currentDomainId = currentFabricId;
+
+            foreach (RegisteredCableInfo cable in RegisteredCables.Values.OrderBy(x => x.CableId))
+            {
+                if (cable == null)
+                    continue;
+
+                if (externalLacpCableIds.Contains(cable.CableId))
+                    continue;
+
+                string localDeviceId;
+                string remoteDeviceId;
+                if (!TryResolveRemoteDeviceForSpecificLocal(deviceId, cable, out localDeviceId, out remoteDeviceId))
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(remoteDeviceId))
+                    continue;
+
+                profile.TouchedCableIds.Add(cable.CableId);
+
+                bool remoteIsKnownSwitch = deviceIdToFabricId.ContainsKey(remoteDeviceId);
+                if (remoteIsKnownSwitch)
+                {
+                    string remoteFabricId = deviceIdToFabricId[remoteDeviceId];
+                    string remoteDomainId;
+                    if (!fabricToDomain.TryGetValue(remoteFabricId, out remoteDomainId))
+                        remoteDomainId = remoteFabricId;
+
+                    if (string.Equals(remoteFabricId, currentFabricId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        profile.InternalFabricEdgeCount++;
+                        continue;
+                    }
+
+                    if (string.Equals(remoteDomainId, currentDomainId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        profile.InterFabricSameDomainEdgeCount++;
+                        profile.DomainPeerFabricIds.Add(remoteFabricId);
+                        continue;
+                    }
+
+                    profile.DomainExitEdgeCount++;
+                    continue;
+                }
+
+                if (remoteDeviceId.StartsWith("SERVERROOT:", StringComparison.OrdinalIgnoreCase) ||
+                    remoteDeviceId.StartsWith("SERVERFAMILY:", StringComparison.OrdinalIgnoreCase))
+                {
+                    profile.ExternalServerEdgeCount++;
+                    continue;
+                }
+
+                profile.ExternalUnknownEdgeCount++;
+            }
+
+            profile.IngressScore =
+                (profile.ExternalServerEdgeCount * 10.0f) +
+                (profile.ExternalUnknownEdgeCount * 6.0f) +
+                (profile.DomainExitEdgeCount * 5.0f) +
+                (profile.InterFabricSameDomainEdgeCount * 3.0f) +
+                (profile.InternalFabricEdgeCount * 0.25f);
+
+            return profile;
+        }
+
+        private static Dictionary<string, RemoteEdgeAccumulator> BuildRemoteEdgeAccumulators(
+            FabricRuntimePlan plan,
+            Dictionary<string, string> deviceIdToFabricId,
+            Dictionary<string, string> fabricToDomain,
+            HashSet<int> externalLacpCableIds,
+            ref int internalPassThroughCount,
+            HashSet<int> internalPassThroughCableIds,
+            ref int interFabricPassThroughCount,
+            HashSet<int> interFabricPassThroughCableIds,
+            ref int fanoutCandidateCount,
+            HashSet<int> fanoutCandidateCableIds,
+            ref int propagatedEdgeCount,
+            ref int propagatedDownstreamCount)
+        {
+            Dictionary<string, RemoteEdgeAccumulator> result =
+                new Dictionary<string, RemoteEdgeAccumulator>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (RegisteredCableInfo cable in RegisteredCables.Values.OrderBy(x => x.CableId))
+            {
+                if (cable == null)
+                    continue;
+
+                if (externalLacpCableIds.Contains(cable.CableId))
+                    continue;
+
+                string localDeviceId;
+                string remoteDeviceId;
+                if (!TryResolveRemoteDeviceFromLiveCable(cable, plan.MemberIds, out localDeviceId, out remoteDeviceId))
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(localDeviceId) || string.IsNullOrWhiteSpace(remoteDeviceId))
+                    continue;
+
+                bool remoteIsKnownFabricMember = false;
+                bool sameFabric = false;
+                bool sameDomain = false;
+                bool remoteIsDomainExit = false;
+
+                string remoteFabricId;
+                if (deviceIdToFabricId.TryGetValue(remoteDeviceId, out remoteFabricId))
+                {
+                    remoteIsKnownFabricMember = true;
+                    sameFabric = string.Equals(remoteFabricId, plan.FabricId, StringComparison.OrdinalIgnoreCase);
+
+                    string remoteDomainId;
+                    if (!fabricToDomain.TryGetValue(remoteFabricId, out remoteDomainId))
+                        remoteDomainId = remoteFabricId;
+
+                    sameDomain = string.Equals(remoteDomainId, plan.DomainId, StringComparison.OrdinalIgnoreCase);
+                    remoteIsDomainExit = !sameDomain;
+                }
+
+                if (remoteIsKnownFabricMember && sameFabric)
+                {
+                    internalPassThroughCount++;
+                    internalPassThroughCableIds.Add(cable.CableId);
+                    continue;
+                }
+
+                if (remoteIsKnownFabricMember && sameDomain)
+                {
+                    interFabricPassThroughCount++;
+                    interFabricPassThroughCableIds.Add(cable.CableId);
+
+                    propagatedEdgeCount++;
+
+                    DomainPropagationIntent intent = new DomainPropagationIntent();
+                    intent.DomainId = plan.DomainId;
+                    intent.FromFabricId = plan.FabricId;
+                    intent.ToFabricId = remoteFabricId;
+                    intent.FromPreferredIngress = plan.PreferredIngressSwitchId;
+                    intent.ToPreferredIngress = string.Empty;
+                    intent.EstimatedBandwidthGbps = plan.EstimatedCapacityGbps;
+                    intent.IntentKind = "inter-fabric-link";
+                    intent.CableIds.Add(cable.CableId);
+                    plan.OutboundPropagationIntents.Add(intent);
+
+                    continue;
+                }
+
+                string key = remoteDeviceId;
+                RemoteEdgeAccumulator accumulator;
+                if (!result.TryGetValue(key, out accumulator))
+                {
+                    accumulator = new RemoteEdgeAccumulator();
+                    accumulator.FabricId = plan.FabricId;
+                    accumulator.DomainId = plan.DomainId;
+                    accumulator.RemoteDeviceId = remoteDeviceId;
+                    accumulator.IsKnownSwitchRemote = remoteIsKnownFabricMember;
+                    accumulator.IsDomainExit = remoteIsDomainExit;
+                    accumulator.IsExternalDownstream = !remoteIsKnownFabricMember;
+                    result[key] = accumulator;
+                }
+
+                LocalEdgeBucket bucket;
+                if (!accumulator.LocalBuckets.TryGetValue(localDeviceId, out bucket))
+                {
+                    bucket = new LocalEdgeBucket();
+                    bucket.OwnerLocalDeviceId = localDeviceId;
+                    accumulator.LocalBuckets[localDeviceId] = bucket;
+                }
+
+                bucket.LocalMembers.Add(localDeviceId);
+                bucket.CableIds.Add(cable.CableId);
+                accumulator.AllCableIds.Add(cable.CableId);
+
+                if (accumulator.IsDomainExit || accumulator.IsExternalDownstream)
+                {
+                    propagatedDownstreamCount++;
+                }
+            }
+
+            foreach (RemoteEdgeAccumulator accumulator in result.Values.OrderBy(x => x.RemoteDeviceId, StringComparer.OrdinalIgnoreCase))
+            {
+                if (accumulator.TotalCableCount >= 2 && accumulator.LocalBuckets.Count > 1)
+                {
+                    fanoutCandidateCount++;
+                    foreach (int id in accumulator.AllCableIds)
+                        fanoutCandidateCableIds.Add(id);
+                }
+
+                if (accumulator.IsDomainExit || accumulator.IsExternalDownstream)
+                {
+                    DomainPropagationIntent intent = new DomainPropagationIntent();
+                    intent.DomainId = plan.DomainId;
+                    intent.FromFabricId = plan.FabricId;
+                    intent.ToFabricId = accumulator.IsKnownSwitchRemote ? "REMOTE-DOMAIN" : "DOWNSTREAM";
+                    intent.FromPreferredIngress = plan.PreferredIngressSwitchId;
+                    intent.ToPreferredIngress = accumulator.RemoteDeviceId;
+                    intent.EstimatedBandwidthGbps = plan.EstimatedCapacityGbps;
+                    intent.IntentKind = accumulator.IsDomainExit ? "domain-exit" : "downstream-exit";
+
+                    foreach (int cableId in accumulator.AllCableIds.OrderBy(x => x))
+                        intent.CableIds.Add(cableId);
+
+                    plan.OutboundPropagationIntents.Add(intent);
+                }
+            }
+
+            return result;
+        }
+
+        private static void ApplyFabricTags(List<FabricRuntimePlan> plans)
+        {
+            foreach (FabricRuntimePlan plan in plans)
+            {
+                int memberCount = plan.Members.Count;
+
+                for (int i = 0; i < memberCount; i++)
+                {
+                    RegisteredSwitchInfo member = plan.Members[i];
+                    if (member == null || member.GameObject == null)
+                        continue;
+
+                    try
+                    {
+                        FabricGroupTag tag = member.GameObject.GetComponent<FabricGroupTag>();
+                        if (tag == null)
+                            tag = member.GameObject.AddComponent<FabricGroupTag>();
+
+                        tag.FabricId = plan.FabricId;
+                        tag.DomainId = plan.DomainId;
+                        tag.MemberIndex = i;
+                        tag.MemberCount = memberCount;
+                        tag.AggregatedBandwidth = plan.EstimatedCapacityGbps;
+                        tag.DomainAggregatedBandwidth = plan.DomainEstimatedCapacityGbps;
+                        tag.AggregatedPortCount = memberCount;
+                        tag.IsPreferredIngress = string.Equals(
+                            member.DeviceName,
+                            plan.PreferredIngressSwitchId,
+                            StringComparison.OrdinalIgnoreCase);
+                        tag.PreferredIngressSwitchId = plan.PreferredIngressSwitchId;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogToFile("ApplyFabricTags failed for " + member.DeviceName + " | " + ex.Message);
+                    }
+                }
+            }
+        }
+
+        private static Dictionary<string, HashSet<string>> BuildFabricAdjacency(
+            Dictionary<string, string> deviceIdToFabricId,
+            HashSet<int> externalLacpCableIds)
+        {
+            Dictionary<string, HashSet<string>> adjacency =
+                new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string fabricId in deviceIdToFabricId.Values.Distinct(StringComparer.OrdinalIgnoreCase))
+                adjacency[fabricId] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (RegisteredCableInfo cable in RegisteredCables.Values.OrderBy(x => x.CableId))
+            {
+                if (cable == null)
+                    continue;
+
+                if (externalLacpCableIds.Contains(cable.CableId))
+                    continue;
+
+                string deviceA = PreserveSwitchIdentity(cable.DeviceA);
+                string deviceB = PreserveSwitchIdentity(cable.DeviceB);
+
+                if (string.IsNullOrWhiteSpace(deviceA) || string.IsNullOrWhiteSpace(deviceB))
+                    continue;
+
+                string fabricA;
+                string fabricB;
+
+                if (!deviceIdToFabricId.TryGetValue(deviceA, out fabricA))
+                    continue;
+
+                if (!deviceIdToFabricId.TryGetValue(deviceB, out fabricB))
+                    continue;
+
+                if (string.Equals(fabricA, fabricB, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                adjacency[fabricA].Add(fabricB);
+                adjacency[fabricB].Add(fabricA);
+
+                string signature = cable.CableId.ToString(CultureInfo.InvariantCulture) + "|" + fabricA + "|" + fabricB;
+                if (LoggedDomainLinkSignatures.Add(signature))
+                {
+                    LogToFile(
+                        "DOMAIN LINK | cableId=" + cable.CableId.ToString(CultureInfo.InvariantCulture) +
+                        " | fabricA=" + fabricA +
+                        " | fabricB=" + fabricB +
+                        " | deviceA=" + deviceA +
+                        " | deviceB=" + deviceB
+                    );
+                }
+            }
+
+            return adjacency;
+        }
+
+        private static Dictionary<string, string> BuildRoutingDomains(
+            Dictionary<string, HashSet<string>> fabricAdjacency,
+            List<string> allFabricIds)
+        {
+            Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int domainIndex = 1;
+
+            foreach (string start in allFabricIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                if (visited.Contains(start))
+                    continue;
+
+                string domainId = "DOMAIN-" + domainIndex.ToString("000", CultureInfo.InvariantCulture);
+                domainIndex++;
+
+                Queue<string> queue = new Queue<string>();
+                queue.Enqueue(start);
+                visited.Add(start);
+
+                while (queue.Count > 0)
+                {
+                    string current = queue.Dequeue();
+                    result[current] = domainId;
+
+                    HashSet<string> neighbors;
+                    if (!fabricAdjacency.TryGetValue(current, out neighbors))
+                        continue;
+
+                    foreach (string neighbor in neighbors)
+                    {
+                        if (visited.Add(neighbor))
+                            queue.Enqueue(neighbor);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static void LogFanoutCandidate(FabricRuntimePlan plan, RemoteEdgeAccumulator accumulator)
+        {
+            string signature =
+                plan.FabricId + "|" +
+                plan.DomainId + "|" +
+                accumulator.RemoteDeviceId + "|" +
+                string.Join(",", accumulator.LocalBuckets.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "|" +
+                string.Join(",", accumulator.AllCableIds.OrderBy(x => x));
+
+            if (!LoggedFanoutCandidateSignatures.Add(signature))
+                return;
+
+            LogToFile(
+                "FANOUT CANDIDATE | fabricId=" + plan.FabricId +
+                " | domainId=" + plan.DomainId +
+                " | preferredIngress=" + plan.PreferredIngressSwitchId +
+                " | remote=" + accumulator.RemoteDeviceId +
+                " | localMembers=[" + string.Join(",", accumulator.LocalBuckets.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                " | cableIds=[" + string.Join(",", accumulator.AllCableIds.OrderBy(x => x)) + "]"
+            );
+        }
+
+        private static void LogFabricPlan(FabricRuntimePlan plan)
+        {
+            string signature =
+                plan.FabricId + "|" +
+                plan.DomainId + "|" +
+                plan.PreferredIngressSwitchId + "|" +
+                string.Join(",", plan.DomainFabricIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
+
+            if (LoggedFabricPlanSignatures.Add(signature))
+            {
+                LogToFile(
+                    "FABRIC SHARE PLAN | fabricId=" + plan.FabricId +
+                    " | domainId=" + plan.DomainId +
+                    " | preferredIngress=" + plan.PreferredIngressSwitchId +
+                    " | ingressScore=" + plan.PreferredIngressScore.ToString("0.##", CultureInfo.InvariantCulture) +
+                    " | domainCapacityGbps=" + plan.DomainEstimatedCapacityGbps.ToString("0.##", CultureInfo.InvariantCulture) +
+                    " | memberIds=[" + string.Join(",", plan.MemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                    " | domainFabrics=[" + string.Join(",", plan.DomainFabricIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]"
+                );
+            }
+
+            foreach (SwitchTrafficProfile profile in plan.SwitchProfiles.Values.OrderByDescending(p => p.IngressScore).ThenBy(p => p.DeviceId, StringComparer.OrdinalIgnoreCase))
+            {
+                LogToFile(
+                    "FABRIC MEMBER SCORE | fabricId=" + plan.FabricId +
+                    " | device=" + profile.DeviceId +
+                    " | preferredIngress=" + profile.IsPreferredIngress.ToString().ToLowerInvariant() +
+                    " | ingressScore=" + profile.IngressScore.ToString("0.##", CultureInfo.InvariantCulture) +
+                    " | serverEdges=" + profile.ExternalServerEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                    " | unknownEdges=" + profile.ExternalUnknownEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                    " | domainExitEdges=" + profile.DomainExitEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                    " | interFabricSameDomain=" + profile.InterFabricSameDomainEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                    " | internalFabric=" + profile.InternalFabricEdgeCount.ToString(CultureInfo.InvariantCulture) +
+                    " | touchedCables=[" + string.Join(",", profile.TouchedCableIds.OrderBy(x => x)) + "]"
+                );
+            }
+
+            foreach (DomainPropagationIntent intent in plan.OutboundPropagationIntents
+                .OrderBy(i => i.IntentKind, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(i => i.ToFabricId, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(i => i.ToPreferredIngress, StringComparer.OrdinalIgnoreCase))
+            {
+                string sig =
+                    intent.DomainId + "|" +
+                    intent.FromFabricId + "|" +
+                    intent.ToFabricId + "|" +
+                    intent.IntentKind + "|" +
+                    string.Join(",", intent.CableIds.OrderBy(x => x));
+
+                if (!LoggedPropagationSignatures.Add(sig))
+                    continue;
+
+                LogToFile(
+                    "DOMAIN PROPAGATION | domainId=" + intent.DomainId +
+                    " | fromFabric=" + intent.FromFabricId +
+                    " | toFabric=" + intent.ToFabricId +
+                    " | kind=" + intent.IntentKind +
+                    " | fromIngress=" + intent.FromPreferredIngress +
+                    " | toIngress=" + intent.ToPreferredIngress +
+                    " | estGbps=" + intent.EstimatedBandwidthGbps.ToString("0.##", CultureInfo.InvariantCulture) +
+                    " | cableIds=[" + string.Join(",", intent.CableIds.OrderBy(x => x)) + "]"
+                );
             }
         }
 
@@ -542,130 +1207,6 @@ namespace AutoSwitch
             return result;
         }
 
-        private static Dictionary<string, BundleBuilder> BuildBundlesForFabricFromLiveRegistry(
-            string currentFabricId,
-            HashSet<string> localIds,
-            Dictionary<string, string> deviceIdToFabricId,
-            HashSet<int> globallyClaimedCableIds,
-            HashSet<int> externalLacpCableIds,
-            ref int crossFabricSkipCount,
-            HashSet<int> crossFabricSkippedCableIds,
-            ref int unknownRemoteCandidateCount,
-            HashSet<int> unknownRemoteCandidateCableIds)
-        {
-            Dictionary<string, BundleBuilder> result =
-                new Dictionary<string, BundleBuilder>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (RegisteredCableInfo cable in RegisteredCables.Values.OrderBy(x => x.CableId))
-            {
-                if (cable == null)
-                    continue;
-
-                if (globallyClaimedCableIds.Contains(cable.CableId))
-                    continue;
-
-                if (externalLacpCableIds.Contains(cable.CableId))
-                    continue;
-
-                string localDeviceId;
-                string remoteDeviceId;
-                if (!TryResolveRemoteDeviceFromLiveCable(cable, localIds, out localDeviceId, out remoteDeviceId))
-                    continue;
-
-                if (string.IsNullOrWhiteSpace(localDeviceId) || string.IsNullOrWhiteSpace(remoteDeviceId))
-                    continue;
-
-                bool remoteIsSwitch = LooksLikeSwitchIdentity(remoteDeviceId);
-                if (remoteIsSwitch)
-                {
-                    string remoteFabricId;
-                    if (deviceIdToFabricId.TryGetValue(remoteDeviceId, out remoteFabricId))
-                    {
-                        if (!string.Equals(remoteFabricId, currentFabricId, StringComparison.OrdinalIgnoreCase))
-                        {
-                            crossFabricSkipCount++;
-                            crossFabricSkippedCableIds.Add(cable.CableId);
-                            LogCrossFabricSkip(cable.CableId, currentFabricId, localDeviceId, remoteDeviceId, remoteFabricId);
-                            continue;
-                        }
-                    }
-                    else
-                    {
-                        unknownRemoteCandidateCount++;
-                        unknownRemoteCandidateCableIds.Add(cable.CableId);
-                        LogUnknownRemoteCandidate(cable.CableId, currentFabricId, localDeviceId, remoteDeviceId);
-                    }
-                }
-
-                string key = currentFabricId + "||" + remoteDeviceId;
-                BundleBuilder builder;
-                if (!result.TryGetValue(key, out builder))
-                {
-                    builder = new BundleBuilder();
-                    builder.FabricId = currentFabricId;
-                    builder.RemoteDeviceId = remoteDeviceId;
-                    result[key] = builder;
-                }
-
-                builder.CableIds.Add(cable.CableId);
-                builder.LocalMemberIds.Add(localDeviceId);
-                builder.RefreshOwner();
-
-                globallyClaimedCableIds.Add(cable.CableId);
-            }
-
-            return result;
-        }
-
-        private static void LogCrossFabricSkip(
-            int cableId,
-            string localFabricId,
-            string localDeviceId,
-            string remoteDeviceId,
-            string remoteFabricId)
-        {
-            string signature =
-                cableId.ToString(CultureInfo.InvariantCulture) + "|" +
-                localFabricId + "|" +
-                localDeviceId + "|" +
-                remoteDeviceId + "|" +
-                remoteFabricId;
-
-            if (!LoggedCrossFabricSignatures.Add(signature))
-                return;
-
-            LogToFile(
-                "CROSS FABRIC SKIP | cableId=" + cableId.ToString(CultureInfo.InvariantCulture) +
-                " | localFabric=" + localFabricId +
-                " | localDevice=" + localDeviceId +
-                " | remoteDevice=" + remoteDeviceId +
-                " | remoteFabric=" + remoteFabricId
-            );
-        }
-
-        private static void LogUnknownRemoteCandidate(
-            int cableId,
-            string localFabricId,
-            string localDeviceId,
-            string remoteDeviceId)
-        {
-            string signature =
-                cableId.ToString(CultureInfo.InvariantCulture) + "|" +
-                localFabricId + "|" +
-                localDeviceId + "|" +
-                remoteDeviceId;
-
-            if (!LoggedUnknownRemoteCandidateSignatures.Add(signature))
-                return;
-
-            LogToFile(
-                "UNKNOWN REMOTE CANDIDATE | cableId=" + cableId.ToString(CultureInfo.InvariantCulture) +
-                " | localFabric=" + localFabricId +
-                " | localDevice=" + localDeviceId +
-                " | remoteDevice=" + remoteDeviceId
-            );
-        }
-
         private static bool TryResolveRemoteDeviceFromLiveCable(
             RegisteredCableInfo cable,
             HashSet<string> localIds,
@@ -699,6 +1240,51 @@ namespace AutoSwitch
             }
 
             if (bIsLocal)
+            {
+                localDeviceId = cable.DeviceB;
+                remoteDeviceId = BuildRemoteIdentity(
+                    cable.CableId,
+                    localDeviceId,
+                    cable.DeviceA,
+                    cable.ExtraA,
+                    cable.ServerRootKeyA,
+                    cable.EndpointSwitchIdA,
+                    cable.PortA);
+                return !string.IsNullOrWhiteSpace(remoteDeviceId);
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveRemoteDeviceForSpecificLocal(
+            string specificLocalDeviceId,
+            RegisteredCableInfo cable,
+            out string localDeviceId,
+            out string remoteDeviceId)
+        {
+            localDeviceId = null;
+            remoteDeviceId = null;
+
+            if (cable == null || string.IsNullOrWhiteSpace(specificLocalDeviceId))
+                return false;
+
+            if (string.Equals(cable.DeviceA, specificLocalDeviceId, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(cable.DeviceB, specificLocalDeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                localDeviceId = cable.DeviceA;
+                remoteDeviceId = BuildRemoteIdentity(
+                    cable.CableId,
+                    localDeviceId,
+                    cable.DeviceB,
+                    cable.ExtraB,
+                    cable.ServerRootKeyB,
+                    cable.EndpointSwitchIdB,
+                    cable.PortB);
+                return !string.IsNullOrWhiteSpace(remoteDeviceId);
+            }
+
+            if (string.Equals(cable.DeviceB, specificLocalDeviceId, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(cable.DeviceA, specificLocalDeviceId, StringComparison.OrdinalIgnoreCase))
             {
                 localDeviceId = cable.DeviceB;
                 remoteDeviceId = BuildRemoteIdentity(
@@ -754,32 +1340,6 @@ namespace AutoSwitch
             }
 
             return string.Empty;
-        }
-
-        private static string PreserveSwitchIdentity(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw))
-                return string.Empty;
-
-            string trimmed = raw.Trim();
-
-            if (LooksLikeSwitchIdentity(trimmed))
-                return trimmed;
-
-            return string.Empty;
-        }
-
-        private static bool LooksLikeSwitchIdentity(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw))
-                return false;
-
-            string trimmed = raw.Trim();
-
-            return trimmed.StartsWith("Switch32xQSFP", StringComparison.OrdinalIgnoreCase) ||
-                   trimmed.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase) ||
-                   trimmed.StartsWith("Switch4xSFP", StringComparison.OrdinalIgnoreCase) ||
-                   trimmed.StartsWith("Switch16CU", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void LogRemoteResolution(
@@ -891,6 +1451,19 @@ namespace AutoSwitch
             return string.Empty;
         }
 
+        private static string PreserveSwitchIdentity(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return string.Empty;
+
+            string trimmed = raw.Trim();
+
+            if (LooksLikeSwitchIdentity(trimmed))
+                return trimmed;
+
+            return string.Empty;
+        }
+
         private static bool IsSwitchLikeIdentity(string value)
         {
             if (string.IsNullOrWhiteSpace(value))
@@ -902,6 +1475,11 @@ namespace AutoSwitch
                    normalized.StartsWith("Switch4xQSXP16xSFP", StringComparison.OrdinalIgnoreCase) ||
                    normalized.StartsWith("Switch4xSFP", StringComparison.OrdinalIgnoreCase) ||
                    normalized.StartsWith("Switch16CU", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool LooksLikeSwitchIdentity(string raw)
+        {
+            return IsSwitchLikeIdentity(raw);
         }
 
         internal static bool GroupTouchesManagedIds(LACPGroupSaveData group, HashSet<string> managedIds)
@@ -1350,9 +1928,9 @@ namespace AutoSwitch
             {
                 _desiredBundles = bundles
                     .Select(CloneBundle)
-                    .OrderBy(b => b.FabricId)
-                    .ThenBy(b => b.OwnerLocalDeviceId)
-                    .ThenBy(b => b.RemoteDeviceId)
+                    .OrderBy(b => b.FabricId, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(b => b.RemoteDeviceId, StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
                 _desiredManagedIds = new HashSet<string>(managedIds, StringComparer.OrdinalIgnoreCase);
@@ -1425,7 +2003,7 @@ namespace AutoSwitch
 
             List<int> removedGroupIds = new List<int>();
 
-            foreach (int ownedId in _ownedGroupIds.OrderBy(x => x).ToList())
+            foreach (int ownedId in _ownedGroupIds.OrderBy(x => x))
             {
                 try
                 {
@@ -1474,11 +2052,22 @@ namespace AutoSwitch
 
             foreach (BundleBuilder bundle in desiredBundles)
             {
-                bundle.RefreshOwner();
-
                 List<int> distinctIds = bundle.CableIds.Distinct().OrderBy(x => x).ToList();
                 if (distinctIds.Count < 2)
                     continue;
+
+                if (bundle.LocalMemberIds.Count != 1)
+                {
+                    AutoSwitchMod.LogToFile(
+                        "AUTO LACP | skipped multi-local bundle | fabricId=" + bundle.FabricId +
+                        " | domainId=" + bundle.DomainId +
+                        " | ownerLocal=" + bundle.OwnerLocalDeviceId +
+                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
+                        " | deviceB=" + bundle.RemoteDeviceId +
+                        " | cableIds=[" + string.Join(",", distinctIds) + "]"
+                    );
+                    continue;
+                }
 
                 try
                 {
@@ -1514,9 +2103,12 @@ namespace AutoSwitch
                     AutoSwitchMod.LogToFile(
                         "AUTO LACP | created groupId=" + groupId.ToString(CultureInfo.InvariantCulture) +
                         " | fabricId=" + bundle.FabricId +
+                        " | domainId=" + bundle.DomainId +
                         " | ownerLocal=" + bundle.OwnerLocalDeviceId +
-                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x)) + "]" +
+                        " | ownerPreferredIngress=" + bundle.IsIngressPreferredOwner.ToString().ToLowerInvariant() +
+                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
                         " | deviceB=" + bundle.RemoteDeviceId +
+                        " | downstreamExit=" + bundle.IsPredictedDownstreamExit.ToString().ToLowerInvariant() +
                         " | cableIds=[" + string.Join(",", distinctIds) + "]"
                     );
                 }
@@ -1524,8 +2116,9 @@ namespace AutoSwitch
                 {
                     AutoSwitchMod.LogToFile(
                         "AUTO LACP | CreateLACPGroup failed | fabricId=" + bundle.FabricId +
+                        " | domainId=" + bundle.DomainId +
                         " | ownerLocal=" + bundle.OwnerLocalDeviceId +
-                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x)) + "]" +
+                        " | localMembers=[" + string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "]" +
                         " | deviceB=" + bundle.RemoteDeviceId +
                         " | cableIds=[" + string.Join(",", distinctIds) + "]" +
                         " | " + ex
@@ -1564,22 +2157,23 @@ namespace AutoSwitch
             List<string> parts = new List<string>();
 
             foreach (BundleBuilder bundle in bundles
-                .OrderBy(b => b.FabricId)
-                .ThenBy(b => b.OwnerLocalDeviceId)
-                .ThenBy(b => b.RemoteDeviceId))
+                .OrderBy(b => b.FabricId, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(b => b.OwnerLocalDeviceId, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(b => b.RemoteDeviceId, StringComparer.OrdinalIgnoreCase))
             {
-                bundle.RefreshOwner();
-
                 parts.Add(
                     bundle.FabricId + "|" +
+                    bundle.DomainId + "|" +
                     bundle.OwnerLocalDeviceId + "|" +
                     bundle.RemoteDeviceId + "|" +
-                    string.Join(",", bundle.LocalMemberIds.OrderBy(x => x)) + "|" +
+                    bundle.IsIngressPreferredOwner.ToString().ToLowerInvariant() + "|" +
+                    bundle.IsPredictedDownstreamExit.ToString().ToLowerInvariant() + "|" +
+                    string.Join(",", bundle.LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "|" +
                     string.Join(",", bundle.CableIds.Distinct().OrderBy(x => x))
                 );
             }
 
-            parts.Add("managed:" + string.Join(",", managedIds.OrderBy(x => x)));
+            parts.Add("managed:" + string.Join(",", managedIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)));
 
             return string.Join(" || ", parts);
         }
@@ -1588,9 +2182,12 @@ namespace AutoSwitch
         {
             BundleBuilder clone = new BundleBuilder();
             clone.FabricId = source.FabricId;
+            clone.DomainId = source.DomainId;
             clone.FabricEstimatedSpeedGbps = source.FabricEstimatedSpeedGbps;
             clone.OwnerLocalDeviceId = source.OwnerLocalDeviceId;
             clone.RemoteDeviceId = source.RemoteDeviceId;
+            clone.IsIngressPreferredOwner = source.IsIngressPreferredOwner;
+            clone.IsPredictedDownstreamExit = source.IsPredictedDownstreamExit;
 
             foreach (string id in source.LocalMemberIds)
                 clone.LocalMemberIds.Add(id);
@@ -1598,7 +2195,6 @@ namespace AutoSwitch
             foreach (int cableId in source.CableIds)
                 clone.CableIds.Add(cableId);
 
-            clone.RefreshOwner();
             return clone;
         }
     }
@@ -1608,10 +2204,14 @@ namespace AutoSwitch
         public FabricGroupTag(IntPtr ptr) : base(ptr) { }
 
         public string FabricId { get; set; }
+        public string DomainId { get; set; }
         public int MemberIndex { get; set; }
         public int MemberCount { get; set; }
         public float AggregatedBandwidth { get; set; }
+        public float DomainAggregatedBandwidth { get; set; }
         public int AggregatedPortCount { get; set; }
+        public bool IsPreferredIngress { get; set; }
+        public string PreferredIngressSwitchId { get; set; }
     }
 
     internal sealed class RegisteredSwitchInfo
@@ -1648,21 +2248,86 @@ namespace AutoSwitch
     internal sealed class BundleBuilder
     {
         public string FabricId;
+        public string DomainId;
         public float FabricEstimatedSpeedGbps;
         public string OwnerLocalDeviceId;
         public string RemoteDeviceId;
+        public bool IsIngressPreferredOwner;
+        public bool IsPredictedDownstreamExit;
         public readonly List<int> CableIds = new List<int>();
         public readonly HashSet<string> LocalMemberIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
 
-        public void RefreshOwner()
+    internal sealed class LocalEdgeBucket
+    {
+        public string OwnerLocalDeviceId;
+        public readonly List<int> CableIds = new List<int>();
+        public readonly HashSet<string> LocalMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal sealed class RemoteEdgeAccumulator
+    {
+        public string FabricId;
+        public string DomainId;
+        public string RemoteDeviceId;
+        public bool IsKnownSwitchRemote;
+        public bool IsDomainExit;
+        public bool IsExternalDownstream;
+
+        public readonly Dictionary<string, LocalEdgeBucket> LocalBuckets =
+            new Dictionary<string, LocalEdgeBucket>(StringComparer.OrdinalIgnoreCase);
+
+        public readonly HashSet<int> AllCableIds = new HashSet<int>();
+
+        public int TotalCableCount
         {
-            if (LocalMemberIds.Count == 0)
-            {
-                OwnerLocalDeviceId = string.Empty;
-                return;
-            }
-
-            OwnerLocalDeviceId = LocalMemberIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).First();
+            get { return AllCableIds.Count; }
         }
+    }
+
+    internal sealed class FabricRuntimePlan
+    {
+        public string FabricId;
+        public string DomainId;
+        public float EstimatedCapacityGbps;
+        public float DomainEstimatedCapacityGbps;
+        public string PreferredIngressSwitchId;
+        public float PreferredIngressScore;
+
+        public readonly List<RegisteredSwitchInfo> Members = new List<RegisteredSwitchInfo>();
+        public readonly HashSet<string> MemberIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, SwitchTrafficProfile> SwitchProfiles =
+            new Dictionary<string, SwitchTrafficProfile>(StringComparer.OrdinalIgnoreCase);
+
+        public List<string> DomainFabricIds = new List<string>();
+        public readonly List<DomainPropagationIntent> OutboundPropagationIntents =
+            new List<DomainPropagationIntent>();
+    }
+
+    internal sealed class SwitchTrafficProfile
+    {
+        public string DeviceId;
+        public int InternalFabricEdgeCount;
+        public int InterFabricSameDomainEdgeCount;
+        public int DomainExitEdgeCount;
+        public int ExternalServerEdgeCount;
+        public int ExternalUnknownEdgeCount;
+        public float IngressScore;
+        public bool IsPreferredIngress;
+
+        public readonly HashSet<int> TouchedCableIds = new HashSet<int>();
+        public readonly HashSet<string> DomainPeerFabricIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal sealed class DomainPropagationIntent
+    {
+        public string DomainId;
+        public string FromFabricId;
+        public string ToFabricId;
+        public string FromPreferredIngress;
+        public string ToPreferredIngress;
+        public float EstimatedBandwidthGbps;
+        public string IntentKind;
+        public readonly List<int> CableIds = new List<int>();
     }
 }
