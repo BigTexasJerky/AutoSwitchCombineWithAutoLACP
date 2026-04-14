@@ -1054,6 +1054,7 @@ namespace AutoSwitch
                 {
                     PatchIfFound(networkMapType, "RegisterSwitch", nameof(NetworkMap_RegisterSwitch_Postfix));
                     PatchIfFound(networkMapType, "RegisterCableConnection", nameof(NetworkMap_RegisterCableConnection_Postfix));
+                    PatchIfFound(networkMapType, "FindAllRoutes", nameof(NetworkMap_FindAllRoutes_Postfix));
                 }
             }
             catch (Exception ex)
@@ -1149,6 +1150,53 @@ namespace AutoSwitch
             catch (Exception ex)
             {
                 LogToFile("NetworkMap_RegisterCableConnection_Postfix failed: " + ex);
+            }
+        }
+
+        private static void NetworkMap_FindAllRoutes_Postfix(
+            object __instance,
+            string __0,
+            string __1,
+            ref List<List<string>> __result)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(__0) || string.IsNullOrWhiteSpace(__1))
+                    return;
+
+                Dictionary<string, HashSet<string>> graph = BuildAugmentedGraph(__instance);
+                if (graph.Count == 0)
+                    return;
+
+                List<string> route = FindAugmentedShortestPath(graph, __0, __1);
+                if (route == null || route.Count < 2)
+                    return;
+
+                if (__result == null)
+                    __result = new List<List<string>>();
+
+                string newSignature = string.Join(">", route);
+                foreach (List<string> existing in __result)
+                {
+                    if (existing == null)
+                        continue;
+
+                    if (string.Equals(string.Join(">", existing), newSignature, StringComparison.OrdinalIgnoreCase))
+                        return;
+                }
+
+                __result.Add(route);
+
+                LogToFile(
+                    "VIRTUAL ROUTE | start=" + __0 +
+                    " | target=" + __1 +
+                    " | hops=" + route.Count.ToString(CultureInfo.InvariantCulture) +
+                    " | path=[" + string.Join(" -> ", route) + "]"
+                );
+            }
+            catch (Exception ex)
+            {
+                LogToFile("NetworkMap_FindAllRoutes_Postfix failed: " + ex);
             }
         }
 
