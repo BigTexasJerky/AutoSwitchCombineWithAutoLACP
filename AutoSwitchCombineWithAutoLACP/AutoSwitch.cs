@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.22", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.23", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -106,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.22 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.23 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.22 active. Synthetic virtual edges quarantined from domain-link detection with regroup cooldown during fabric membership churn.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.23 active. Synthetic edges filtered harder and reload wake now tries switch TurnOnCommonFunction/ReconnectCables without power-cycling.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -850,6 +850,9 @@ namespace AutoSwitch
                 if (cable == null)
                     continue;
 
+                if (cable.CableId < 0 || SyntheticRegisteredCableIds.Contains(cable.CableId))
+                    continue;
+
                 if (externalLacpCableIds.Contains(cable.CableId))
                     continue;
 
@@ -976,6 +979,9 @@ namespace AutoSwitch
             foreach (RegisteredCableInfo cable in RegisteredCables.Values.OrderBy(x => x.CableId))
             {
                 if (cable == null)
+                    continue;
+
+                if (cable.CableId < 0 || SyntheticRegisteredCableIds.Contains(cable.CableId))
                     continue;
 
                 if (externalLacpCableIds.Contains(cable.CableId))
@@ -3576,6 +3582,12 @@ namespace AutoSwitch
                                 switchMethodCalls += InvokeSwitchWakeCandidates(root);
                             }
                             catch { }
+
+                            try
+                            {
+                                powerToggleCalls += InvokeNonDestructiveSwitchOnCandidates(root);
+                            }
+                            catch { }
                         }
 
                         // Public-release safety: do not power-cycle switches here.
@@ -3644,6 +3656,57 @@ namespace AutoSwitch
         private static int InvokeNetworkWakeCandidates(NetworkMap networkMap)
         {
             return 0;
+        }
+
+        private static int TryInvokeZeroArgMethod(Component component, string methodName)
+        {
+            if (component == null || string.IsNullOrWhiteSpace(methodName))
+                return 0;
+
+            return TryInvokeCachedWakeMethod(component, methodName);
+        }
+
+        private static int InvokeNonDestructiveSwitchOnCandidates(GameObject root)
+        {
+            if (root == null)
+                return 0;
+
+            int invoked = 0;
+            Component[] components;
+            try
+            {
+                components = root.GetComponentsInChildren<Component>(true);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (components == null)
+                return 0;
+
+            foreach (Component component in components)
+            {
+                if (component == null)
+                    continue;
+
+                Type type = component.GetType();
+                if (type == null)
+                    continue;
+
+                string typeName = type.FullName ?? type.Name ?? string.Empty;
+                if (typeName.IndexOf("NetworkSwitch", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                invoked += TryInvokeZeroArgMethod(component, "TurnOnCommonFunction");
+                invoked += TryInvokeZeroArgMethod(component, "ReconnectCables");
+                invoked += TryInvokeZeroArgMethod(component, "UpdateScreenUI");
+                invoked += TryInvokeZeroArgMethod(component, "RefreshStatus");
+                invoked += TryInvokeZeroArgMethod(component, "CheckPower");
+            }
+
+            return invoked;
         }
 
         private static GameObject ChooseSacrificialSwitchRoot(IEnumerable<GameObject> roots)
