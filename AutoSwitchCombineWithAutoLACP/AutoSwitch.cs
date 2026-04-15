@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.23", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.24", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -106,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.23 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.24 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.23 active. Synthetic edges filtered harder and reload wake now tries switch TurnOnCommonFunction/ReconnectCables without power-cycling.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.24 active. Added delayed anchor-focused reload wake retries while keeping non-destructive switch wake and stable fabric logic.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3180,6 +3180,7 @@ namespace AutoSwitch
         private static string _lastFollowupRegroupSignature = string.Empty;
 
         private const float InitialDelaySeconds = 8.0f;
+        private const float AdditionalSceneWakeDelaySeconds = 12.0f;
         private const float MinDelaySeconds = 0.35f;
         private const float MinGapBetweenRunsSeconds = 0.50f;
 
@@ -3224,6 +3225,15 @@ namespace AutoSwitch
         internal static void QueueSceneWakePulse()
         {
             QueueSwitchWakePulse("scene bootstrap");
+            MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed anchor", AdditionalSceneWakeDelaySeconds));
+        }
+
+        private static IEnumerator RunDelayedSceneWakePulse(string reason, float delaySeconds)
+        {
+            if (delaySeconds > 0f)
+                yield return new WaitForSeconds(delaySeconds);
+
+            QueueSwitchWakePulse(reason);
         }
 
         private static void QueueFollowupRegroupIfNeeded()
@@ -3506,6 +3516,42 @@ namespace AutoSwitch
             MelonCoroutines.Start(RunSwitchWakePulse(reason));
         }
 
+        private static string GetPreferredWakeSwitchId()
+        {
+            lock (_stateLock)
+            {
+                return _desiredBundles
+                    .Select(b => b != null ? (b.OwnerLocalDeviceId ?? string.Empty) : string.Empty)
+                    .FirstOrDefault(s => !string.IsNullOrWhiteSpace(s)) ?? string.Empty;
+            }
+        }
+
+        private static bool RootMatchesPreferredSwitchId(GameObject root, string preferredSwitchId)
+        {
+            if (root == null || string.IsNullOrWhiteSpace(preferredSwitchId))
+                return false;
+
+            string rootName = root.name ?? string.Empty;
+            if (rootName.IndexOf(preferredSwitchId, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            try
+            {
+                foreach (Component component in root.GetComponentsInChildren<Component>(true))
+                {
+                    if (component == null)
+                        continue;
+
+                    string componentName = component.name ?? string.Empty;
+                    if (componentName.IndexOf(preferredSwitchId, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
         private static IEnumerator RunSwitchWakePulse(string reason)
         {
             const int maxAttempts = 10;
@@ -3553,8 +3599,18 @@ namespace AutoSwitch
                     if (switchRoots.Count > 0)
                     {
                         _lastServerWakeRealtime = Time.realtimeSinceStartup;
+                        string preferredWakeSwitchId = GetPreferredWakeSwitchId();
+                        bool anchorOnly = reason.IndexOf("delayed anchor", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                        foreach (GameObject root in switchRoots.Values)
+                        IEnumerable<GameObject> orderedRoots = switchRoots.Values
+                            .Where(r => r != null)
+                            .OrderByDescending(r => RootMatchesPreferredSwitchId(r, preferredWakeSwitchId) ? 1 : 0)
+                            .ThenBy(r => r.name ?? string.Empty, StringComparer.OrdinalIgnoreCase);
+
+                        if (anchorOnly && !string.IsNullOrWhiteSpace(preferredWakeSwitchId))
+                            orderedRoots = orderedRoots.Where(r => RootMatchesPreferredSwitchId(r, preferredWakeSwitchId)).Take(1).ToList();
+
+                        foreach (GameObject root in orderedRoots)
                         {
                             if (root == null)
                                 continue;
@@ -3620,6 +3676,8 @@ namespace AutoSwitch
 
                         AutoSwitchMod.LogToFile(
                             "SWITCH WAKE | reason=" + reason +
+                            " | preferred=" + preferredWakeSwitchId +
+                            " | anchorOnly=" + anchorOnly.ToString().ToLowerInvariant() +
                             " | touched=" + touched.ToString(CultureInfo.InvariantCulture) +
                             " | behaviourToggles=" + behaviourToggles.ToString(CultureInfo.InvariantCulture) +
                             " | objectPulses=" + objectPulses.ToString(CultureInfo.InvariantCulture) +
@@ -3646,8 +3704,12 @@ namespace AutoSwitch
                     continue;
                 }
 
+                string preferredWakeSwitchIdFinal = GetPreferredWakeSwitchId();
+                bool anchorOnlyFinal = reason.IndexOf("delayed anchor", StringComparison.OrdinalIgnoreCase) >= 0;
                 AutoSwitchMod.LogToFile(
                     "SWITCH WAKE | reason=" + reason +
+                    " | preferred=" + preferredWakeSwitchIdFinal +
+                    " | anchorOnly=" + anchorOnlyFinal.ToString().ToLowerInvariant() +
                     " | touched=0 | behaviourToggles=0 | objectPulses=0 | cablePulses=0 | networkCalls=0 | switchMethodCalls=0 | powerToggleCalls=0 | attempts=" + attempt.ToString(CultureInfo.InvariantCulture));
                 yield break;
             }
