@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.21", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.22", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -96,6 +96,8 @@ namespace AutoSwitch
 
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
+        internal static string _lastFabricMembershipSignature = string.Empty;
+        internal static bool _fabricChurnCooldownPending = false;
 
         public override void OnInitializeMelon()
         {
@@ -104,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.11 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.22 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.21 active. Safe public-release build: experimental switch wake power cycling disabled to avoid cable disconnect side effects.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.22 active. Synthetic virtual edges quarantined from domain-link detection with regroup cooldown during fabric membership churn.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -119,6 +121,8 @@ namespace AutoSwitch
 
             _nextScanTime = 0f;
             _lastSummary = string.Empty;
+            AutoSwitchMod._lastFabricMembershipSignature = string.Empty;
+            AutoSwitchMod._fabricChurnCooldownPending = false;
 
             RegisteredSwitches.Clear();
             RegisteredCables.Clear();
@@ -212,6 +216,33 @@ namespace AutoSwitch
             SwitchIdToFabricIdSnapshot.Clear();
             foreach (KeyValuePair<string, string> kvp in deviceIdToFabricId)
                 SwitchIdToFabricIdSnapshot[kvp.Key] = kvp.Value;
+
+            string fabricMembershipSignature = string.Join(
+                "|",
+                fabricIdToMembers
+                    .OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(kvp => kvp.Key + "=" + string.Join(",", kvp.Value.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))));
+
+            if (!string.IsNullOrWhiteSpace(_lastFabricMembershipSignature) &&
+                !string.Equals(_lastFabricMembershipSignature, fabricMembershipSignature, StringComparison.Ordinal))
+            {
+                if (!_fabricChurnCooldownPending)
+                {
+                    _fabricChurnCooldownPending = true;
+                    _lastFabricMembershipSignature = fabricMembershipSignature;
+                    LogToFile("FABRIC CHURN COOLDOWN | reason=membership-changed | fabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) + " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture));
+                    SaveDataAutoLACP.QueueRegroup("fabric churn cooldown");
+                    return;
+                }
+
+                _fabricChurnCooldownPending = false;
+            }
+            else
+            {
+                _fabricChurnCooldownPending = false;
+            }
+
+            _lastFabricMembershipSignature = fabricMembershipSignature;
 
             HashSet<string> allManagedIds = new HashSet<string>(
                 deviceIdToFabricId.Keys,
@@ -683,6 +714,9 @@ namespace AutoSwitch
             foreach (RegisteredCableInfo cable in RegisteredCables.Values.OrderBy(x => x.CableId))
             {
                 if (cable == null)
+                    continue;
+
+                if (cable.CableId < 0 || SyntheticRegisteredCableIds.Contains(cable.CableId))
                     continue;
 
                 if (externalLacpCableIds.Contains(cable.CableId))
@@ -3169,6 +3203,8 @@ namespace AutoSwitch
             _lastServerWakeRealtime = 0f;
             CachedWakeMethods.Clear();
             _lastFollowupRegroupSignature = string.Empty;
+            AutoSwitchMod._lastFabricMembershipSignature = string.Empty;
+            AutoSwitchMod._fabricChurnCooldownPending = false;
 
             lock (_stateLock)
             {
