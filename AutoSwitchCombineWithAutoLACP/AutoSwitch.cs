@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.20", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.21", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -109,7 +109,7 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.20 active. Direct NetworkSwitch.PowerButton wake path with public-release-safe ID-agnostic selection.");
+            MelonLogger.Msg("[AutoSwitch] v2.21.21 active. Safe public-release build: experimental switch wake power cycling disabled to avoid cable disconnect side effects.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3542,13 +3542,9 @@ namespace AutoSwitch
                             catch { }
                         }
 
-                        try
-                        {
-                            GameObject sacrificial = ChooseSacrificialSwitchRoot(switchRoots.Values);
-                            if (sacrificial != null)
-                                powerToggleCalls += TrySwitchPowerMicroToggle(sacrificial);
-                        }
-                        catch { }
+                        // Public-release safety: do not power-cycle switches here.
+                        // NetworkSwitch.PowerButton() appears to perform real disconnect/reconnect behavior,
+                        // which can leave live fabrics in a bad state after reload.
 
                         foreach (Behaviour behaviour in UnityEngine.Object.FindObjectsOfType<Behaviour>(true))
                         {
@@ -3693,116 +3689,9 @@ namespace AutoSwitch
 
         private static int TrySwitchPowerMicroToggle(GameObject root)
         {
-            if (root == null)
-                return 0;
-
-            int invoked = 0;
-
-            Component[] components;
-            try
-            {
-                components = root.GetComponentsInChildren<Component>(true);
-            }
-            catch
-            {
-                return 0;
-            }
-
-            if (components == null)
-                return 0;
-
-            foreach (Component component in components)
-            {
-                if (component == null)
-                    continue;
-
-                Type type = component.GetType();
-                if (type == null)
-                    continue;
-
-                string typeName = type.FullName ?? type.Name ?? string.Empty;
-                if (typeName.IndexOf("NetworkSwitch", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    int direct = 0;
-                    direct += TryInvokeCachedWakeBooleanMethod(component, "PowerButton", false);
-                    direct += TryInvokeCachedWakeBooleanMethod(component, "PowerButton", true);
-                    if (direct > 0)
-                        return direct;
-                }
-            }
-
-            try
-            {
-                invoked += TryInvokeButtonPowerInteraction(root);
-                if (invoked > 0)
-                    return invoked;
-            }
-            catch { }
-
-            foreach (Component component in components)
-            {
-                if (component == null)
-                    continue;
-
-                Type type = component.GetType();
-                if (type == null)
-                    continue;
-
-                string typeName = type.FullName ?? type.Name ?? string.Empty;
-                string gameObjectName = component.gameObject != null ? (component.gameObject.name ?? string.Empty) : string.Empty;
-                if (typeName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0 &&
-                    typeName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) < 0 &&
-                    gameObjectName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) < 0)
-                    continue;
-
-                bool didOff = false;
-                foreach (string methodName in SwitchPowerOffMethodNameHints)
-                {
-                    if (TryInvokeCachedWakeMethod(component, methodName) > 0)
-                    {
-                        invoked++;
-                        didOff = true;
-                        break;
-                    }
-                }
-
-                if (didOff)
-                {
-                    foreach (string methodName in SwitchPowerOnMethodNameHints)
-                    {
-                        if (TryInvokeCachedWakeMethod(component, methodName) > 0)
-                        {
-                            invoked++;
-                            return invoked;
-                        }
-                    }
-                }
-
-                foreach (string methodName in SwitchPowerToggleMethodNameHints)
-                {
-                    if (TryInvokeCachedWakeBooleanMethod(component, methodName, false) > 0)
-                    {
-                        invoked++;
-                        if (TryInvokeCachedWakeBooleanMethod(component, methodName, true) > 0)
-                        {
-                            invoked++;
-                            return invoked;
-                        }
-                    }
-                }
-
-                foreach (string memberName in SwitchPowerStateMemberNameHints)
-                {
-                    if (TryToggleBooleanLikeMember(component, memberName))
-                    {
-                        invoked += 2;
-                        return invoked;
-                    }
-                }
-            }
-
-            return invoked;
+            return 0;
         }
+
 
 
         private static int TryInvokeButtonPowerInteraction(GameObject root)
