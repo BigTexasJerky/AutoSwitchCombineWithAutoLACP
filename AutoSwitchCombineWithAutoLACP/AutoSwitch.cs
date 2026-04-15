@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "2.21.24", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "3.0.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -106,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 2.21.24 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 3.0.0 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v2.21.24 active. Added delayed anchor-focused reload wake retries while keeping non-destructive switch wake and stable fabric logic.");
+            MelonLogger.Msg("[AutoSwitch] v3.0.0 active. Added normalized anchor matching and a second delayed anchor wake while keeping non-destructive switch wake and stable fabric logic.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3105,7 +3105,7 @@ namespace AutoSwitch
             return null;
         }
 
-        private static string NormalizeCloneName(string name)
+        internal static string NormalizeCloneName(string name)
         {
             if (string.IsNullOrWhiteSpace(name))
                 return string.Empty;
@@ -3117,7 +3117,7 @@ namespace AutoSwitch
             return result;
         }
 
-        private static string NormalizeRuntimeIdentity(string raw)
+        internal static string NormalizeRuntimeIdentity(string raw)
         {
             if (string.IsNullOrWhiteSpace(raw))
                 return string.Empty;
@@ -3181,6 +3181,7 @@ namespace AutoSwitch
 
         private const float InitialDelaySeconds = 8.0f;
         private const float AdditionalSceneWakeDelaySeconds = 12.0f;
+        private const float AdditionalSceneWakeDelaySecondsSecond = 20.0f;
         private const float MinDelaySeconds = 0.35f;
         private const float MinGapBetweenRunsSeconds = 0.50f;
 
@@ -3226,6 +3227,7 @@ namespace AutoSwitch
         {
             QueueSwitchWakePulse("scene bootstrap");
             MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed anchor", AdditionalSceneWakeDelaySeconds));
+            MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed anchor late", AdditionalSceneWakeDelaySecondsSecond));
         }
 
         private static IEnumerator RunDelayedSceneWakePulse(string reason, float delaySeconds)
@@ -3531,9 +3533,46 @@ namespace AutoSwitch
             if (root == null || string.IsNullOrWhiteSpace(preferredSwitchId))
                 return false;
 
-            string rootName = root.name ?? string.Empty;
-            if (rootName.IndexOf(preferredSwitchId, StringComparison.OrdinalIgnoreCase) >= 0)
+            string preferredRaw = preferredSwitchId.Trim();
+            string preferredBase = AutoSwitchMod.NormalizeRuntimeIdentity(preferredRaw);
+
+            bool Matches(string candidate)
+            {
+                if (string.IsNullOrWhiteSpace(candidate))
+                    return false;
+
+                string raw = candidate.Trim();
+                string clone = AutoSwitchMod.NormalizeCloneName(raw);
+                string baseId = AutoSwitchMod.NormalizeRuntimeIdentity(clone);
+
+                return string.Equals(raw, preferredRaw, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(clone, preferredRaw, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(baseId, preferredRaw, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(raw, preferredBase, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(clone, preferredBase, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(baseId, preferredBase, StringComparison.OrdinalIgnoreCase) ||
+                       raw.IndexOf(preferredRaw, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                       clone.IndexOf(preferredRaw, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                       raw.IndexOf(preferredBase, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                       clone.IndexOf(preferredBase, StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+
+            if (Matches(root.name))
                 return true;
+
+            try
+            {
+                FabricGroupTag directTag = root.GetComponent<FabricGroupTag>();
+                if (directTag != null)
+                {
+                    if (Matches(directTag.AnchorSwitchId))
+                        return true;
+
+                    if (directTag.IsAnchor && !string.IsNullOrWhiteSpace(preferredRaw))
+                        return true;
+                }
+            }
+            catch { }
 
             try
             {
@@ -3542,9 +3581,40 @@ namespace AutoSwitch
                     if (component == null)
                         continue;
 
-                    string componentName = component.name ?? string.Empty;
-                    if (componentName.IndexOf(preferredSwitchId, StringComparison.OrdinalIgnoreCase) >= 0)
+                    if (Matches(component.name))
                         return true;
+
+                    try
+                    {
+                        FabricGroupTag tag = component as FabricGroupTag;
+                        if (tag != null)
+                        {
+                            if (Matches(tag.AnchorSwitchId))
+                                return true;
+
+                            if (tag.IsAnchor && !string.IsNullOrWhiteSpace(preferredRaw))
+                                return true;
+                        }
+                    }
+                    catch { }
+
+                    try
+                    {
+                        Type componentType = component.GetType();
+                        if (componentType != null &&
+                            (componentType.Name.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             componentType.FullName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            MethodInfo getSwitchId = componentType.GetMethod("GetSwitchId", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                            if (getSwitchId != null)
+                            {
+                                object value = getSwitchId.Invoke(component, null);
+                                if (Matches(Convert.ToString(value, CultureInfo.InvariantCulture)))
+                                    return true;
+                            }
+                        }
+                    }
+                    catch { }
                 }
             }
             catch { }
