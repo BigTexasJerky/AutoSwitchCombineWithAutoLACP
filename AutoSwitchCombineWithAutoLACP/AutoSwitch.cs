@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "3.0.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "3.0.1", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -106,12 +106,12 @@ namespace AutoSwitch
             Directory.CreateDirectory(DebugFolderPath);
             File.WriteAllText(
                 DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 3.0.0 debug log started." + Environment.NewLine
+                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 3.0.1 debug log started." + Environment.NewLine
             );
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v3.0.0 active. Added normalized anchor matching and a second delayed anchor wake while keeping non-destructive switch wake and stable fabric logic.");
+            MelonLogger.Msg("[AutoSwitch] v3.0.1 active. Added random sacrificial switch power micro-toggle wake experiment while keeping stable fabric logic.");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -3227,7 +3227,7 @@ namespace AutoSwitch
         {
             QueueSwitchWakePulse("scene bootstrap");
             MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed anchor", AdditionalSceneWakeDelaySeconds));
-            MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed anchor late", AdditionalSceneWakeDelaySecondsSecond));
+            MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed random power", AdditionalSceneWakeDelaySecondsSecond));
         }
 
         private static IEnumerator RunDelayedSceneWakePulse(string reason, float delaySeconds)
@@ -3677,8 +3677,26 @@ namespace AutoSwitch
                             .OrderByDescending(r => RootMatchesPreferredSwitchId(r, preferredWakeSwitchId) ? 1 : 0)
                             .ThenBy(r => r.name ?? string.Empty, StringComparer.OrdinalIgnoreCase);
 
+                        bool randomPowerOnly = reason.IndexOf("random power", StringComparison.OrdinalIgnoreCase) >= 0;
+
                         if (anchorOnly && !string.IsNullOrWhiteSpace(preferredWakeSwitchId))
                             orderedRoots = orderedRoots.Where(r => RootMatchesPreferredSwitchId(r, preferredWakeSwitchId)).Take(1).ToList();
+                        else if (randomPowerOnly)
+                        {
+                            List<GameObject> eligibleRoots = orderedRoots
+                                .Where(r => r != null)
+                                .Where(r => !string.IsNullOrWhiteSpace(r.name))
+                                .Where(r => r.name.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0)
+                                .ToList();
+
+                            if (eligibleRoots.Count > 0)
+                            {
+                                int seed = Environment.TickCount ^ eligibleRoots.Count;
+                                System.Random rng = new System.Random(seed);
+                                GameObject chosen = eligibleRoots[rng.Next(eligibleRoots.Count)];
+                                orderedRoots = new List<GameObject> { chosen };
+                            }
+                        }
 
                         foreach (GameObject root in orderedRoots)
                         {
@@ -3711,14 +3729,17 @@ namespace AutoSwitch
 
                             try
                             {
-                                powerToggleCalls += InvokeNonDestructiveSwitchOnCandidates(root);
+                                bool randomPowerOnlyCurrent = reason.IndexOf("random power", StringComparison.OrdinalIgnoreCase) >= 0;
+                                if (randomPowerOnlyCurrent)
+                                    powerToggleCalls += TrySwitchPowerMicroToggle(root);
+                                else
+                                    powerToggleCalls += InvokeNonDestructiveSwitchOnCandidates(root);
                             }
                             catch { }
                         }
 
-                        // Public-release safety: do not power-cycle switches here.
-                        // NetworkSwitch.PowerButton() appears to perform real disconnect/reconnect behavior,
-                        // which can leave live fabrics in a bad state after reload.
+                        // Public-release safety: only the dedicated random-power experiment below uses
+                        // a real switch power interaction, and only on one randomly selected switch.
 
                         foreach (Behaviour behaviour in UnityEngine.Object.FindObjectsOfType<Behaviour>(true))
                         {
@@ -3920,7 +3941,66 @@ namespace AutoSwitch
 
         private static int TrySwitchPowerMicroToggle(GameObject root)
         {
-            return 0;
+            if (root == null)
+                return 0;
+
+            int invoked = 0;
+            Component[] components;
+            try
+            {
+                components = root.GetComponentsInChildren<Component>(true);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (components == null)
+                return 0;
+
+            foreach (Component component in components)
+            {
+                if (component == null)
+                    continue;
+
+                Type type = component.GetType();
+                if (type == null)
+                    continue;
+
+                string typeName = type.FullName ?? type.Name ?? string.Empty;
+                if (typeName.IndexOf("NetworkSwitch", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    typeName.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                try
+                {
+                    MethodInfo powerButton = type.GetMethod(
+                        "PowerButton",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        null,
+                        new[] { typeof(bool) },
+                        null);
+
+                    if (powerButton != null)
+                    {
+                        powerButton.Invoke(component, new object[] { false });
+                        powerButton.Invoke(component, new object[] { false });
+                        return 2;
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    invoked += TryInvokeZeroArgMethod(component, "TurnOffCommonFunctions");
+                    invoked += TryInvokeZeroArgMethod(component, "TurnOnCommonFunction");
+                    if (invoked > 0)
+                        return invoked;
+                }
+                catch { }
+            }
+
+            return invoked;
         }
 
 
