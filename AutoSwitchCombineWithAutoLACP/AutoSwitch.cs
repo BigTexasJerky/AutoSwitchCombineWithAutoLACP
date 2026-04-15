@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "3.0.1", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "1.0.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -34,6 +34,8 @@ namespace AutoSwitch
 
         private static readonly Regex TrailingRuntimeIdRegex =
             new Regex(@"_[\-]?\d+$", RegexOptions.Compiled);
+
+        private const bool DebugLoggingEnabled = false;
 
         private static string DebugFolderPath =>
             Path.Combine(MelonEnvironment.ModsDirectory, "AutoSwitch");
@@ -103,15 +105,21 @@ namespace AutoSwitch
         {
             ClassInjector.RegisterTypeInIl2Cpp<FabricGroupTag>();
 
-            Directory.CreateDirectory(DebugFolderPath);
-            File.WriteAllText(
-                DebugLogPath,
-                "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 3.0.1 debug log started." + Environment.NewLine
-            );
+            if (DebugLoggingEnabled)
+            {
+                Directory.CreateDirectory(DebugFolderPath);
+                File.WriteAllText(
+                    DebugLogPath,
+                    "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 1.0.0 debug log started." + Environment.NewLine
+                );
+            }
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] v3.0.1 active. Added random sacrificial switch power micro-toggle wake experiment while keeping stable fabric logic.");
+            MelonLogger.Msg("[AutoSwitch] ╔══════════════════════════════════════════╗");
+            MelonLogger.Msg("[AutoSwitch] ║   Auto Switch initialized            ║");
+            MelonLogger.Msg("[AutoSwitch] ║   The packets learned line dancing ║");
+            MelonLogger.Msg("[AutoSwitch] ╚══════════════════════════════════════════╝");
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -429,7 +437,6 @@ namespace AutoSwitch
             if (!string.Equals(summary, _lastSummary, StringComparison.Ordinal))
             {
                 _lastSummary = summary;
-                MelonLogger.Msg("[AutoSwitch] " + summary);
                 LogToFile(summary);
 
                 foreach (string domainId in fabricToDomain.Values.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
@@ -3127,6 +3134,9 @@ namespace AutoSwitch
 
         internal static void LogToFile(string message)
         {
+            if (!DebugLoggingEnabled)
+                return;
+
             try
             {
                 if (!ShouldWriteDebugLine(message))
@@ -3143,7 +3153,7 @@ namespace AutoSwitch
 
         private static bool ShouldWriteDebugLine(string message)
         {
-            if (string.IsNullOrWhiteSpace(message))
+            if (!DebugLoggingEnabled || string.IsNullOrWhiteSpace(message))
                 return false;
 
             string[] noisyPrefixes = new[]
@@ -3153,7 +3163,18 @@ namespace AutoSwitch
                 "REMOTE RESOLVE |",
                 "REHYDRATED PROFILE |",
                 "SYNTHETIC CABLE REGISTERED |",
-                "VIRTUAL EDGE |"
+                "VIRTUAL EDGE |",
+                "FABRIC CONTROLLER |",
+                "FABRIC MEMBER SCORE |",
+                "SYNTHETIC FABRIC SHARE |",
+                "FABRIC SHARE PLAN |",
+                "SCAN SUMMARY |",
+                "ROUTING DOMAIN |",
+                "FABRIC |",
+                "FABRIC BUNDLE CABLE MAP |",
+                "AUTO LACP | skipped",
+                "AUTO LACP | regroup complete",
+                "SWITCH WAKE |"
             };
 
             foreach (string prefix in noisyPrefixes)
@@ -3196,7 +3217,6 @@ namespace AutoSwitch
                 return;
 
             _bootstrapStarted = true;
-            MelonLogger.Msg("[AutoSwitch] Live Auto-LACP bootstrap armed.");
             MelonCoroutines.Start(BootstrapRoutine());
         }
 
@@ -3315,7 +3335,6 @@ namespace AutoSwitch
                 return;
 
             _regroupQueued = true;
-            MelonLogger.Msg("[AutoSwitch] Live Auto-LACP queued: " + reason);
             MelonCoroutines.Start(RunQueuedRegroup());
         }
 
