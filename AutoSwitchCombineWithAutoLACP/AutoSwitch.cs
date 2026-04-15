@@ -98,6 +98,9 @@ namespace AutoSwitch
 
         private float _nextScanTime;
         private string _lastSummary = string.Empty;
+        private static bool _startupBannerPending = false;
+        private static bool _startupBannerShown = false;
+        private static float _startupBannerAfterTime = 0f;
         internal static string _lastFabricMembershipSignature = string.Empty;
         internal static bool _fabricChurnCooldownPending = false;
 
@@ -116,10 +119,9 @@ namespace AutoSwitch
 
             InstallNativePatches();
 
-            MelonLogger.Msg("[AutoSwitch] ╔══════════════════════════════════════════╗");
-            MelonLogger.Msg("[AutoSwitch] ║   Auto Switch initialized            ║");
-            MelonLogger.Msg("[AutoSwitch] ║   The packets learned line dancing ║");
-            MelonLogger.Msg("[AutoSwitch] ╚══════════════════════════════════════════╝");
+            _startupBannerPending = true;
+            _startupBannerShown = false;
+            _startupBannerAfterTime = 0f;
         }
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
@@ -129,6 +131,9 @@ namespace AutoSwitch
 
             _nextScanTime = 0f;
             _lastSummary = string.Empty;
+            _startupBannerPending = true;
+            _startupBannerShown = false;
+            _startupBannerAfterTime = Time.time + 2.5f;
             AutoSwitchMod._lastFabricMembershipSignature = string.Empty;
             AutoSwitchMod._fabricChurnCooldownPending = false;
 
@@ -165,6 +170,18 @@ namespace AutoSwitch
         {
             try
             {
+                if (_startupBannerPending && !_startupBannerShown && Time.time >= _startupBannerAfterTime)
+                {
+                    MelonLogger.Msg("[AutoSwitch] ╔══════════════════════════════════════════╗");
+                    MelonLogger.Msg("[AutoSwitch] ║   Auto Switch initialized                ║");
+                    MelonLogger.Msg("[AutoSwitch] ║   The packets learned line dancing       ║");
+                    MelonLogger.Msg("[AutoSwitch] ║   Auto combining switches and LACP       ║");
+                    MelonLogger.Msg("[AutoSwitch] ║   V1.0.0 By Big Texas Jerky              ║");
+                    MelonLogger.Msg("[AutoSwitch] ╚══════════════════════════════════════════╝");
+                    _startupBannerShown = true;
+                    _startupBannerPending = false;
+                }
+
                 if (Time.time < _nextScanTime)
                     return;
 
