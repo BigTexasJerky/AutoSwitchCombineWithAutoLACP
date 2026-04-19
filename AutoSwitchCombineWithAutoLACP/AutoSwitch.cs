@@ -103,6 +103,10 @@ namespace AutoSwitch
         private static float _startupBannerAfterTime = 0f;
         internal static string _lastFabricMembershipSignature = string.Empty;
         internal static bool _fabricChurnCooldownPending = false;
+        internal static bool _postScanAnchorWakeQueued = false;
+        internal static string _stableFabricMembershipSignature = string.Empty;
+        internal static int _stableFabricMembershipScanCount = 0;
+        internal static float _earliestWakeRealtime = 0f;
 
         public override void OnInitializeMelon()
         {
@@ -113,7 +117,7 @@ namespace AutoSwitch
                 Directory.CreateDirectory(DebugFolderPath);
                 File.WriteAllText(
                     DebugLogPath,
-                    "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 1.0.0 debug log started." + Environment.NewLine
+                    "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "] AutoSwitch 1.2.9 debug log started." + Environment.NewLine
                 );
             }
 
@@ -136,6 +140,10 @@ namespace AutoSwitch
             _startupBannerAfterTime = Time.time + 2.5f;
             AutoSwitchMod._lastFabricMembershipSignature = string.Empty;
             AutoSwitchMod._fabricChurnCooldownPending = false;
+            AutoSwitchMod._postScanAnchorWakeQueued = false;
+            AutoSwitchMod._stableFabricMembershipSignature = string.Empty;
+            AutoSwitchMod._stableFabricMembershipScanCount = 0;
+            AutoSwitchMod._earliestWakeRealtime = Time.realtimeSinceStartup + 10.0f;
 
             RegisteredSwitches.Clear();
             RegisteredCables.Clear();
@@ -161,7 +169,6 @@ namespace AutoSwitch
 
             SaveDataAutoLACP.ResetForScene();
             SaveDataAutoLACP.StartSafeBootstrap();
-            SaveDataAutoLACP.QueueSceneWakePulse();
 
             LogToFile("Scene loaded: " + sceneName + " (" + buildIndex.ToString(CultureInfo.InvariantCulture) + ")");
         }
@@ -176,7 +183,7 @@ namespace AutoSwitch
                     MelonLogger.Msg("[AutoSwitch] ║   Auto Switch initialized                ║");
                     MelonLogger.Msg("[AutoSwitch] ║   The packets learned line dancing       ║");
                     MelonLogger.Msg("[AutoSwitch] ║   Auto combining switches and LACP       ║");
-                    MelonLogger.Msg("[AutoSwitch] ║   V1.0.0 By Big Texas Jerky              ║");
+                    MelonLogger.Msg("[AutoSwitch] ║   V1.1.0 By Big Texas Jerky              ║");
                     MelonLogger.Msg("[AutoSwitch] ╚══════════════════════════════════════════╝");
                     _startupBannerShown = true;
                     _startupBannerPending = false;
@@ -202,7 +209,7 @@ namespace AutoSwitch
 
             List<RegisteredSwitchInfo> liveSwitches = RegisteredSwitches.Values
                 .Where(s => s != null && s.HasWorldPosition && IsAllowedSwitchModel(s.ModelName))
-                .Where(IsManagedRackMountedSwitch)
+                .Where(IsLikelyPlacedSwitch)
                 .OrderBy(s => s.WorldPosition.x)
                 .ThenBy(s => s.WorldPosition.y)
                 .ThenBy(s => s.WorldPosition.z)
@@ -255,6 +262,10 @@ namespace AutoSwitch
                 {
                     _fabricChurnCooldownPending = true;
                     _lastFabricMembershipSignature = fabricMembershipSignature;
+                    _stableFabricMembershipSignature = fabricMembershipSignature;
+                    _stableFabricMembershipScanCount = 0;
+                    _postScanAnchorWakeQueued = false;
+                    SaveDataAutoLACP.ResetRandomManagedWakeCooldown();
                     LogToFile("FABRIC CHURN COOLDOWN | reason=membership-changed | fabrics=" + fabrics.Count.ToString(CultureInfo.InvariantCulture) + " | liveSwitches=" + liveSwitches.Count.ToString(CultureInfo.InvariantCulture));
                     SaveDataAutoLACP.QueueRegroup("fabric churn cooldown");
                     return;
@@ -268,6 +279,14 @@ namespace AutoSwitch
             }
 
             _lastFabricMembershipSignature = fabricMembershipSignature;
+
+            if (string.Equals(_stableFabricMembershipSignature, fabricMembershipSignature, StringComparison.Ordinal))
+                _stableFabricMembershipScanCount++;
+            else
+            {
+                _stableFabricMembershipSignature = fabricMembershipSignature;
+                _stableFabricMembershipScanCount = 1;
+            }
 
             HashSet<string> allManagedIds = new HashSet<string>(
                 deviceIdToFabricId.Keys,
@@ -431,6 +450,20 @@ namespace AutoSwitch
             }
 
             SaveDataAutoLACP.UpdateDesiredState(allBundles, allManagedIds);
+
+            if (!_postScanAnchorWakeQueued && allBundles.Count > 0 && allManagedIds.Count > 0 && _stableFabricMembershipScanCount >= 2)
+            {
+                if (Time.realtimeSinceStartup >= _earliestWakeRealtime)
+                {
+                    _postScanAnchorWakeQueued = true;
+                    SaveDataAutoLACP.QueueRandomManagedWakePulse("post scan random power");
+                    LogToFile("POST SCAN RANDOM POWER WAKE | bundles=" + allBundles.Count.ToString(CultureInfo.InvariantCulture) + " | managedIds=" + allManagedIds.Count.ToString(CultureInfo.InvariantCulture) + " | stableScans=" + _stableFabricMembershipScanCount.ToString(CultureInfo.InvariantCulture) + " | earliestWakeReached=true");
+                }
+                else
+                {
+                    LogToFile("POST SCAN RANDOM POWER WAKE | delayed | waitRemaining=" + Math.Max(0f, _earliestWakeRealtime - Time.realtimeSinceStartup).ToString("0.00", CultureInfo.InvariantCulture) + "s");
+                }
+            }
 
             int adjacencyPairs = fabrics.Sum(f => Math.Max(0, f.Count - 1));
             string summary =
@@ -2856,104 +2889,6 @@ namespace AutoSwitch
             return AllowedSwitchModels.Contains(NormalizeCloneName(modelName));
         }
 
-        private static bool IsManagedRackMountedSwitch(RegisteredSwitchInfo info)
-        {
-            if (info == null)
-                return false;
-
-            GameObject go = FindSwitchGameObject(info);
-            if (go == null)
-                return false;
-
-            if (!IsUnderRackLanberg47U(go.transform))
-                return false;
-
-            return IsLikelyPlacedSwitch(info);
-        }
-
-        private static GameObject FindSwitchGameObject(RegisteredSwitchInfo info)
-        {
-            if (info == null)
-                return null;
-
-            if (info.GameObject != null)
-                return info.GameObject;
-
-            GameObject go = DiscoverGameObject(info.NetworkSwitchObject);
-            if (go != null)
-                return go;
-
-            if (!string.IsNullOrWhiteSpace(info.DeviceName))
-            {
-                try
-                {
-                    foreach (GameObject candidate in UnityEngine.Object.FindObjectsOfType<GameObject>(true))
-                    {
-                        if (candidate == null)
-                            continue;
-
-                        string discovered = DiscoverBestDeviceName(candidate);
-                        if (string.Equals(discovered, info.DeviceName, StringComparison.OrdinalIgnoreCase))
-                            return candidate;
-                    }
-                }
-                catch { }
-            }
-
-            return null;
-        }
-
-        private static bool IsUnderRackLanberg47U(Transform start)
-        {
-            Transform current = start;
-            int depth = 0;
-
-            while (current != null && depth < 32)
-            {
-                string normalizedName = NormalizeCloneName(current.name);
-                if (string.Equals(normalizedName, "rack_lanberg_47u", StringComparison.OrdinalIgnoreCase))
-                    return true;
-
-                if (LooksLikeTrolleyNode(current.gameObject))
-                    return false;
-
-                current = current.parent;
-                depth++;
-            }
-
-            return false;
-        }
-
-        private static bool LooksLikeTrolleyNode(GameObject go)
-        {
-            if (go == null)
-                return false;
-
-            string objectName = NormalizeCloneName(go.name);
-            if (objectName.IndexOf("trolley", StringComparison.OrdinalIgnoreCase) >= 0)
-                return true;
-
-            try
-            {
-                foreach (Component component in go.GetComponents<Component>())
-                {
-                    if (component == null)
-                        continue;
-
-                    Type type = component.GetType();
-                    if (type == null)
-                        continue;
-
-                    string typeName = type.FullName ?? type.Name ?? string.Empty;
-                    if (typeName.IndexOf("Trolley", StringComparison.OrdinalIgnoreCase) >= 0)
-                        return true;
-                }
-            }
-            catch { }
-
-            return false;
-        }
-
         private static bool IsLikelyPlacedSwitch(RegisteredSwitchInfo info)
         {
             if (info == null || !info.HasWorldPosition)
@@ -3311,6 +3246,13 @@ namespace AutoSwitch
         private static bool _hasAppliedAtLeastOnce;
         private static bool _serverWakeQueued;
         private static float _lastServerWakeRealtime;
+        private static float _lastRandomManagedWakeRealtime = -9999.0f;
+        private const float RandomManagedWakeCooldownSeconds = 20.0f;
+
+        internal static void ResetRandomManagedWakeCooldown()
+        {
+            _lastRandomManagedWakeRealtime = -9999.0f;
+        }
         private static readonly Dictionary<string, System.Reflection.MethodInfo> CachedWakeMethods =
             new Dictionary<string, System.Reflection.MethodInfo>(StringComparer.OrdinalIgnoreCase);
         private static string _lastFollowupRegroupSignature = string.Empty;
@@ -3348,6 +3290,7 @@ namespace AutoSwitch
             _lastFollowupRegroupSignature = string.Empty;
             AutoSwitchMod._lastFabricMembershipSignature = string.Empty;
             AutoSwitchMod._fabricChurnCooldownPending = false;
+            AutoSwitchMod._postScanAnchorWakeQueued = false;
 
             lock (_stateLock)
             {
@@ -3360,9 +3303,12 @@ namespace AutoSwitch
 
         internal static void QueueSceneWakePulse()
         {
-            QueueSwitchWakePulse("scene bootstrap");
-            MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed anchor", AdditionalSceneWakeDelaySeconds));
-            MelonCoroutines.Start(RunDelayedSceneWakePulse("scene delayed random power", AdditionalSceneWakeDelaySecondsSecond));
+            QueueAnchorWakePulse("scene delayed");
+        }
+
+        internal static void QueueAnchorWakePulse(string reason)
+        {
+            QueueSwitchWakePulse((reason ?? string.Empty) + " anchor");
         }
 
         private static IEnumerator RunDelayedSceneWakePulse(string reason, float delaySeconds)
@@ -3472,7 +3418,15 @@ namespace AutoSwitch
             try
             {
                 RebuildAutoLacpGroups();
-                QueueSwitchWakePulse("lacp regroup");
+                if (AutoSwitchMod._stableFabricMembershipScanCount >= 2)
+                {
+                    if (Time.realtimeSinceStartup >= AutoSwitchMod._earliestWakeRealtime)
+                        QueueRandomManagedWakePulse("lacp regroup random power");
+                    else
+                        AutoSwitchMod.LogToFile("RANDOM MANAGED WAKE | skipped early wake window | waitRemaining=" + Math.Max(0f, AutoSwitchMod._earliestWakeRealtime - Time.realtimeSinceStartup).ToString("0.00", CultureInfo.InvariantCulture) + "s");
+                }
+                else
+                    AutoSwitchMod.LogToFile("RANDOM MANAGED WAKE | skipped unstable topology | stableScans=" + AutoSwitchMod._stableFabricMembershipScanCount.ToString(CultureInfo.InvariantCulture));
                 QueueFollowupRegroupIfNeeded();
                 _hasAppliedAtLeastOnce = true;
             }
@@ -3643,6 +3597,23 @@ namespace AutoSwitch
             );
         }
 
+        internal static void QueueRandomManagedWakePulse(string reason)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now - _lastRandomManagedWakeRealtime < RandomManagedWakeCooldownSeconds)
+            {
+                AutoSwitchMod.LogToFile(
+                    "RANDOM MANAGED WAKE | skipped cooldown | elapsed=" +
+                    (now - _lastRandomManagedWakeRealtime).ToString(CultureInfo.InvariantCulture) +
+                    " | cooldown=" + RandomManagedWakeCooldownSeconds.ToString(CultureInfo.InvariantCulture) +
+                    " | reason=" + (reason ?? string.Empty));
+                return;
+            }
+
+            _lastRandomManagedWakeRealtime = now;
+            QueueSwitchWakePulse(reason);
+        }
+
         private static void QueueSwitchWakePulse(string reason)
         {
             if (_serverWakeQueued)
@@ -3660,6 +3631,31 @@ namespace AutoSwitch
                     .Select(b => b != null ? (b.OwnerLocalDeviceId ?? string.Empty) : string.Empty)
                     .FirstOrDefault(s => !string.IsNullOrWhiteSpace(s)) ?? string.Empty;
             }
+        }
+
+        private static HashSet<string> GetDesiredManagedWakeSwitchIds()
+        {
+            lock (_stateLock)
+            {
+                return new HashSet<string>(_desiredManagedIds, StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private static bool RootMatchesAnyManagedSwitchId(GameObject root, HashSet<string> managedSwitchIds)
+        {
+            if (root == null || managedSwitchIds == null || managedSwitchIds.Count == 0)
+                return false;
+
+            foreach (string managedSwitchId in managedSwitchIds)
+            {
+                if (string.IsNullOrWhiteSpace(managedSwitchId))
+                    continue;
+
+                if (RootMatchesPreferredSwitchId(root, managedSwitchId))
+                    return true;
+            }
+
+            return false;
         }
 
         private static bool RootMatchesPreferredSwitchId(GameObject root, string preferredSwitchId)
@@ -3804,7 +3800,7 @@ namespace AutoSwitch
                     {
                         _lastServerWakeRealtime = Time.realtimeSinceStartup;
                         string preferredWakeSwitchId = GetPreferredWakeSwitchId();
-                        bool anchorOnly = reason.IndexOf("delayed anchor", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool anchorOnly = reason.IndexOf("anchor", StringComparison.OrdinalIgnoreCase) >= 0;
 
                         IEnumerable<GameObject> orderedRoots = switchRoots.Values
                             .Where(r => r != null)
@@ -3817,11 +3813,23 @@ namespace AutoSwitch
                             orderedRoots = orderedRoots.Where(r => RootMatchesPreferredSwitchId(r, preferredWakeSwitchId)).Take(1).ToList();
                         else if (randomPowerOnly)
                         {
+                            HashSet<string> desiredManagedWakeIds = GetDesiredManagedWakeSwitchIds();
+
                             List<GameObject> eligibleRoots = orderedRoots
                                 .Where(r => r != null)
                                 .Where(r => !string.IsNullOrWhiteSpace(r.name))
                                 .Where(r => r.name.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0)
+                                .Where(r => desiredManagedWakeIds.Count == 0 || RootMatchesAnyManagedSwitchId(r, desiredManagedWakeIds))
                                 .ToList();
+
+                            if (eligibleRoots.Count == 0)
+                            {
+                                eligibleRoots = orderedRoots
+                                    .Where(r => r != null)
+                                    .Where(r => !string.IsNullOrWhiteSpace(r.name))
+                                    .Where(r => r.name.IndexOf("Switch", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    .ToList();
+                            }
 
                             if (eligibleRoots.Count > 0)
                             {
@@ -3930,7 +3938,7 @@ namespace AutoSwitch
                 }
 
                 string preferredWakeSwitchIdFinal = GetPreferredWakeSwitchId();
-                bool anchorOnlyFinal = reason.IndexOf("delayed anchor", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool anchorOnlyFinal = reason.IndexOf("anchor", StringComparison.OrdinalIgnoreCase) >= 0;
                 AutoSwitchMod.LogToFile(
                     "SWITCH WAKE | reason=" + reason +
                     " | preferred=" + preferredWakeSwitchIdFinal +
