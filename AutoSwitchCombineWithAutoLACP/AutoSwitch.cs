@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using UnityEngine;
 using Component = UnityEngine.Component;
 
-[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "1.0.0", "Big Texas Jerky")]
+[assembly: MelonInfo(typeof(AutoSwitch.AutoSwitchMod), "AutoSwitch", "1.1.0", "Big Texas Jerky")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace AutoSwitch
@@ -202,7 +202,7 @@ namespace AutoSwitch
 
             List<RegisteredSwitchInfo> liveSwitches = RegisteredSwitches.Values
                 .Where(s => s != null && s.HasWorldPosition && IsAllowedSwitchModel(s.ModelName))
-                .Where(IsLikelyPlacedSwitch)
+                .Where(IsManagedRackMountedSwitch)
                 .OrderBy(s => s.WorldPosition.x)
                 .ThenBy(s => s.WorldPosition.y)
                 .ThenBy(s => s.WorldPosition.z)
@@ -2854,6 +2854,104 @@ namespace AutoSwitch
                 return false;
 
             return AllowedSwitchModels.Contains(NormalizeCloneName(modelName));
+        }
+
+        private static bool IsManagedRackMountedSwitch(RegisteredSwitchInfo info)
+        {
+            if (info == null)
+                return false;
+
+            GameObject go = FindSwitchGameObject(info);
+            if (go == null)
+                return false;
+
+            if (!IsUnderRackLanberg47U(go.transform))
+                return false;
+
+            return IsLikelyPlacedSwitch(info);
+        }
+
+        private static GameObject FindSwitchGameObject(RegisteredSwitchInfo info)
+        {
+            if (info == null)
+                return null;
+
+            if (info.GameObject != null)
+                return info.GameObject;
+
+            GameObject go = DiscoverGameObject(info.NetworkSwitchObject);
+            if (go != null)
+                return go;
+
+            if (!string.IsNullOrWhiteSpace(info.DeviceName))
+            {
+                try
+                {
+                    foreach (GameObject candidate in UnityEngine.Object.FindObjectsOfType<GameObject>(true))
+                    {
+                        if (candidate == null)
+                            continue;
+
+                        string discovered = DiscoverBestDeviceName(candidate);
+                        if (string.Equals(discovered, info.DeviceName, StringComparison.OrdinalIgnoreCase))
+                            return candidate;
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        private static bool IsUnderRackLanberg47U(Transform start)
+        {
+            Transform current = start;
+            int depth = 0;
+
+            while (current != null && depth < 32)
+            {
+                string normalizedName = NormalizeCloneName(current.name);
+                if (string.Equals(normalizedName, "rack_lanberg_47u", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                if (LooksLikeTrolleyNode(current.gameObject))
+                    return false;
+
+                current = current.parent;
+                depth++;
+            }
+
+            return false;
+        }
+
+        private static bool LooksLikeTrolleyNode(GameObject go)
+        {
+            if (go == null)
+                return false;
+
+            string objectName = NormalizeCloneName(go.name);
+            if (objectName.IndexOf("trolley", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            try
+            {
+                foreach (Component component in go.GetComponents<Component>())
+                {
+                    if (component == null)
+                        continue;
+
+                    Type type = component.GetType();
+                    if (type == null)
+                        continue;
+
+                    string typeName = type.FullName ?? type.Name ?? string.Empty;
+                    if (typeName.IndexOf("Trolley", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch { }
+
+            return false;
         }
 
         private static bool IsLikelyPlacedSwitch(RegisteredSwitchInfo info)
